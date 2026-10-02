@@ -36,10 +36,13 @@ app.get('/api/health', (req, res) => {
 // Login
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const { email, password } = req.body;
+    const { email } = req.body;
 
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password required' });
+    // NOTE: the frontend login form sends email only (no password field),
+    // so login is email-only for now. Real password authentication is
+    // still TODO before production use.
+    if (!email) {
+      return res.status(400).json({ error: 'Email required' });
     }
 
     const query = 'SELECT id, email, name FROM stewards WHERE LOWER(email) = LOWER($1) LIMIT 1';
