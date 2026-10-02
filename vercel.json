@@ -15,11 +15,12 @@
       "dest": "api/server.js"
     },
     {
-      "src": "/(?!api).*",
-      "dest": "/api/server.js"
+      "src": "/(.*)",
+      "dest": "/api/public/$1"
+    },
+    {
+      "src": "/",
+      "dest": "/api/public/index.html"
     }
-  ],
-  "env": {
-    "NODE_ENV": "production"
-  }
+  ]
 }
