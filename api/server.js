@@ -33,6 +33,31 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+
+// TEMPORARY one-time database setup. Visit /api/admin/setup-db once in the
+// browser, then this route gets removed. Safe to re-run: tables use IF NOT EXISTS.
+app.get('/api/admin/setup-db', async (req, res) => {
+  const statements = [
+    'CREATE TABLE IF NOT EXISTS stewards (id SERIAL PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL UNIQUE)',
+    'CREATE TABLE IF NOT EXISTS companies (id SERIAL PRIMARY KEY, company_code TEXT NOT NULL UNIQUE, company_name TEXT NOT NULL)',
+    'CREATE TABLE IF NOT EXISTS assignments (id SERIAL PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), steward_id INTEGER NOT NULL REFERENCES stewards(id))',
+    "CREATE TABLE IF NOT EXISTS implementations (id SERIAL PRIMARY KEY, company_id INTEGER NOT NULL REFERENCES companies(id), stage TEXT NOT NULL DEFAULT 'Onboarding', status TEXT NOT NULL DEFAULT 'Not Started')"
+  ];
+  try {
+    const db = getPool();
+    for (const sql of statements) {
+      await db.query(sql);
+    }
+    const check = await db.query(
+      "SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename IN ('stewards','companies','assignments','implementations') ORDER BY tablename"
+    );
+    res.json({ success: true, tables: check.rows.map((r) => r.tablename) });
+  } catch (error) {
+    console.error('Setup error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Login
 app.post('/api/auth/login', async (req, res) => {
   try {
