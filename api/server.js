@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const path = require('path');
 const { Pool } = require('pg');
 require('dotenv').config();
 
@@ -15,7 +16,6 @@ const pool = new Pool({
 // Middleware
 app.use(cors());
 app.use(express.json());
-const path = require('path');
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
 // Health check
