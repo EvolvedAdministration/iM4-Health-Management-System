@@ -190,6 +190,90 @@ app.put('/api/implementations/:id', async (req, res) => {
   }
 });
 
+
+// GitHub kanban mirror: pulls cards from the im4health-implementation org's
+// "iM4 Implementation" project board and mirrors them as companies +
+// implementations. Cards with Status Hold/Dead are skipped. Protected by
+// the SYNC_SECRET env var (send as x-sync-secret header).
+async function fetchProjectItems() {
+  const query = 'query($after: String) { organization(login: "im4health-implementation") { projectV2(number: 3) { items(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { id content { __typename ... on DraftIssue { title } ... on Issue { title } ... on PullRequest { title } } fieldValues(first: 20) { nodes { __typename ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } } } } } } } } }';
+  const all = [];
+  let after = null;
+  for (;;) {
+    const resp = await fetch('https://api.github.com/graphql', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + process.env.GITHUB_TOKEN,
+        'Content-Type': 'application/json',
+        'User-Agent': 'im4-sync'
+      },
+      body: JSON.stringify({ query: query, variables: { after: after } })
+    });
+    if (!resp.ok) throw new Error('GitHub API returned ' + resp.status);
+    const data = await resp.json();
+    if (data.errors) throw new Error('GitHub API: ' + data.errors[0].message);
+    const items = data.data.organization.projectV2.items;
+    for (const n of items.nodes) all.push(n);
+    if (!items.pageInfo.hasNextPage) break;
+    after = items.pageInfo.endCursor;
+  }
+  return all;
+}
+
+function slugify(name) {
+  const s = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+  return s || 'company';
+}
+
+app.post('/api/admin/sync-github', async (req, res) => {
+  if (!process.env.SYNC_SECRET || req.headers['x-sync-secret'] !== process.env.SYNC_SECRET) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  if (!process.env.GITHUB_TOKEN) {
+    return res.status(500).json({ error: 'GITHUB_TOKEN is not set' });
+  }
+  try {
+    const db = getPool();
+    await db.query('ALTER TABLE implementations ADD COLUMN IF NOT EXISTS github_item_id TEXT UNIQUE');
+    await db.query('ALTER TABLE implementations ADD COLUMN IF NOT EXISTS card_title TEXT');
+    await db.query('ALTER TABLE implementations ADD COLUMN IF NOT EXISTS payroll_provider TEXT');
+    await db.query('ALTER TABLE implementations ADD COLUMN IF NOT EXISTS payroll_frequency TEXT');
+
+    const items = await fetchProjectItems();
+    let synced = 0;
+    let skipped = 0;
+    const activeIds = [];
+    for (const item of items) {
+      const fields = {};
+      for (const v of item.fieldValues.nodes) {
+        if (v.__typename === 'ProjectV2ItemFieldSingleSelectValue') fields[v.field.name] = v.name;
+      }
+      const status = fields['Status'] || '';
+      if (status === 'Hold' || status === 'Dead') { skipped++; continue; }
+      const fullTitle = (item.content && item.content.title) ? item.content.title : 'Untitled';
+      const companyName = fullTitle.split(';')[0].trim() || 'Unnamed Company';
+      const comp = await db.query(
+        'INSERT INTO companies (company_code, company_name) VALUES ($1, $2) ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name RETURNING id',
+        [slugify(companyName), companyName]
+      );
+      await db.query(
+        'INSERT INTO implementations (company_id, stage, status, github_item_id, card_title, payroll_provider, payroll_frequency) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (github_item_id) DO UPDATE SET company_id = EXCLUDED.company_id, stage = EXCLUDED.stage, status = EXCLUDED.status, card_title = EXCLUDED.card_title, payroll_provider = EXCLUDED.payroll_provider, payroll_frequency = EXCLUDED.payroll_frequency',
+        [comp.rows[0].id, status || 'No Status', fields['Priority'] || 'NORMAL', item.id, fullTitle, fields['Payroll Provider'] || null, fields['Payroll Frequency'] || null]
+      );
+      activeIds.push(item.id);
+      synced++;
+    }
+    if (activeIds.length > 0) {
+      await db.query('DELETE FROM implementations WHERE github_item_id IS NOT NULL AND NOT (github_item_id = ANY($1))', [activeIds]);
+    }
+    const compCount = await db.query('SELECT COUNT(*)::int AS c FROM companies');
+    res.json({ success: true, synced: synced, skipped_hold_dead: skipped, companies: compCount.rows[0].c });
+  } catch (error) {
+    console.error('GitHub sync error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Static files and SPA fallback. API routes are registered above,
 // so they take priority over the static middleware.
 app.use(express.static(path.join(__dirname, '..', 'public')));
