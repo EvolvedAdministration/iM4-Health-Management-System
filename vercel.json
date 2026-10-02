@@ -1,26 +1,14 @@
 {
-  "version": 2,
-  "builds": [
+  "buildCommand": "npm run build",
+  "outputDirectory": "public",
+  "rewrites": [
     {
-      "src": "api/server.js",
-      "use": "@vercel/node",
-      "config": {
-        "includeFiles": "api/public/**"
-      }
-    }
-  ],
-  "routes": [
-    {
-      "src": "/api/(.*)",
-      "dest": "api/server.js"
+      "source": "/api/:path*",
+      "destination": "/api/server.js"
     },
     {
-      "src": "/(.*)",
-      "dest": "/api/public/$1"
-    },
-    {
-      "src": "/",
-      "dest": "/api/public/index.html"
+      "source": "/(.*)",
+      "destination": "/index.html"
     }
   ]
 }
