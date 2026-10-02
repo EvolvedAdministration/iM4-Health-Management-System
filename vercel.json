@@ -1,1 +1,1 @@
-{"outputDirectory":"public","rewrites":[{"destination":"/api/server.js","source":"/api/:path*"},{"destination":"/index.html","source":"/(.*)"}]}
+{"outputDirectory":"public","rewrites":[{"destination":"/api/server","source":"/api/:path*"},{"destination":"/index.html","source":"/(.*)"}]}
