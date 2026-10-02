@@ -1,7 +1,7 @@
 const express = require('express');
 const cors = require('cors');
-const path = require('path');
 const { Pool } = require('pg');
+const path = require('path');
 require('dotenv').config();
 
 const app = express();
@@ -16,7 +16,9 @@ const pool = new Pool({
 // Middleware
 app.use(cors());
 app.use(express.json());
-app.use(express.static(path.join(__dirname, '..', 'public')));
+
+// Serve static files
+app.use(express.static(path.join(__dirname, 'public')));
 
 // Health check
 app.get('/api/health', (req, res) => {
@@ -197,7 +199,5 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+// Export for Vercel serverless
+module.exports = app;
