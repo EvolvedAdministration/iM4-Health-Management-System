@@ -640,14 +640,14 @@ function viewAdminImport() {
       if (rows.length === 0) { document.getElementById('msg').innerHTML = errorHtml('No data rows found.'); return; }
       api.post('/api/admin/import', { type: type, rows: rows, dry_run: true }).then(function (d) {
         var html = '<h3>Validation</h3>' + okHtml(d.valid_count + ' valid rows.') +
-          (d.errors.length ? errorHtml(d.errors.join('<br>')) : '') +
+          (d.errors.length ? '<div class="alert alert-error">' + d.errors.map(esc).join('<br>') + '</div>' : '') +
           (d.errors.length === 0 ? '<button class="btn btn-primary" id="confirm">Confirm import of ' + d.valid_count + ' rows</button>' : '<p class="muted">Fix the errors above and validate again.</p>');
         document.getElementById('preview').innerHTML = html;
         var cb = document.getElementById('confirm');
         if (cb) cb.onclick = function () {
           api.post('/api/admin/import', { type: type, rows: rows, dry_run: false }).then(function (r) {
             document.getElementById('preview').innerHTML = '<h3>Done</h3>' + okHtml('Imported ' + r.imported + ' rows.') +
-              (r.errors.length ? errorHtml(r.errors.join('<br>')) : '');
+              (r.errors.length ? '<div class="alert alert-error">' + r.errors.map(esc).join('<br>') + '</div>' : '');
           }).catch(function (err) { document.getElementById('msg').innerHTML = errorHtml(err.message); });
         };
       }).catch(function (err) { document.getElementById('msg').innerHTML = errorHtml(err.message); });

@@ -641,6 +641,22 @@ app.get('/api/admin/assignments', requireAdmin, async (req, res) => {
 //              payroll_total, payroll_ineligible, payroll_opted_out, payroll_qualified,
 //              payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date
 // assignments: steward_id, company_code
+// Date values: accept YYYY-MM-DD or an Excel serial number (days since 1899-12-30).
+function toISODate(v) {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  if (s === '') return null;
+  let digits = s.length > 0;
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] < '0' || s[i] > '9') { digits = false; break; }
+  }
+  if (digits) {
+    const ms = Date.UTC(1899, 11, 30) + parseInt(s, 10) * 86400000;
+    return new Date(ms).toISOString().slice(0, 10);
+  }
+  return s;
+}
+
 // Header normalization: lowercase, strip "(...)" notes, and accept the ee_*
 // payroll aliases (ee_total, ee_ineligible, ee_optedout, ee_qualified,
 // ee_enrolled, ee_not_enrolled, ee_new_qualified, ee_dataset_date).
@@ -712,7 +728,7 @@ function validateImport(type, rows) {
         payroll_opted_out: num(row.payroll_opted_out), payroll_qualified: num(row.payroll_qualified),
         payroll_enrolled: num(row.payroll_enrolled), payroll_not_enrolled: num(row.payroll_not_enrolled),
         payroll_new_qualified: num(row.payroll_new_qualified),
-        payroll_dataset_date: row.payroll_dataset_date || null
+        payroll_dataset_date: toISODate(row.payroll_dataset_date)
       });
     } else if (type === 'assignments') {
       if (!row.steward_id || !row.company_code) { e('steward_id and company_code are required'); return; }
