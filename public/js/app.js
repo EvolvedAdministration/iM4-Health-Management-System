@@ -92,6 +92,7 @@ function navLinks() {
     links.push(['#/admin/companies', 'Companies']);
     links.push(['#/admin/assignments', 'Assignments']);
     links.push(['#/admin/import', 'Import']);
+    links.push(['#/admin/jobs', 'Jobs']);
   }
   return links;
 }
@@ -655,6 +656,46 @@ function viewAdminImport() {
   });
 }
 
+// ---------------------------------------------------------------- admin: jobs (run sync / summaries on demand)
+function viewAdminJobs() {
+  requireUser(function () {
+    if (state.user.role !== 'admin') { location.hash = '#/clients'; return; }
+    render(shell(
+      '<h2>Jobs</h2><div id="msg"></div>' +
+      '<p class="muted">Run the scheduled jobs on demand. The GitHub sync also runs every 6 hours; summaries run Sunday through Thursday at 9:00 PM.</p>' +
+      '<div class="card-grid">' +
+      '<div class="card"><div class="card-title">GitHub kanban sync</div>' +
+      '<p class="muted">Pulls board cards, links implementations, pulls comments.</p>' +
+      '<button class="btn btn-primary" id="runsync">Run sync now</button><div id="syncout"></div></div>' +
+      '<div class="card"><div class="card-title">Claude project summaries</div>' +
+      '<p class="muted">Generates fresh summaries for every active implementation.</p>' +
+      '<button class="btn btn-primary" id="runsum">Run summaries now</button><div id="sumout"></div></div>' +
+      '</div>',
+      'jobs'));
+    function pretty(d) {
+      return '<pre class="muted">' + esc(JSON.stringify(d, null, 1)) + '</pre>';
+    }
+    document.getElementById('runsync').onclick = function () {
+      var out = document.getElementById('syncout');
+      out.innerHTML = '<p class="muted">Running...</p>';
+      api.post('/api/admin/sync-now', {}).then(function (d) {
+        out.innerHTML = okHtml('Sync finished.') + pretty(d);
+      }).catch(function (err) {
+        out.innerHTML = errorHtml(err.message);
+      });
+    };
+    document.getElementById('runsum').onclick = function () {
+      var out = document.getElementById('sumout');
+      out.innerHTML = '<p class="muted">Running... this can take a minute.</p>';
+      api.post('/api/admin/run-summaries-now', {}).then(function (d) {
+        out.innerHTML = okHtml('Summaries finished.') + pretty(d);
+      }).catch(function (err) {
+        out.innerHTML = errorHtml(err.message);
+      });
+    };
+  });
+}
+
 // ---------------------------------------------------------------- router
 function route() {
   var h = location.hash || '#/login';
@@ -678,6 +719,7 @@ function route() {
   if (pathParts[0] === 'admin' && pathParts[1] === 'companies') return viewAdminCompanies();
   if (pathParts[0] === 'admin' && pathParts[1] === 'assignments') return viewAdminAssignments();
   if (pathParts[0] === 'admin' && pathParts[1] === 'import') return viewAdminImport();
+  if (pathParts[0] === 'admin' && pathParts[1] === 'jobs') return viewAdminJobs();
   location.hash = '#/login';
 }
 

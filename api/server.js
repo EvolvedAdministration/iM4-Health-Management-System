@@ -880,9 +880,8 @@ async function trackStage(db, implId, newStage) {
   await db.query('INSERT INTO stage_history (implementation_id, stage) VALUES ($1, $2)', [implId, newStage]);
 }
 
-app.post('/api/admin/sync-github', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  if (!GITHUB_TOKEN) return res.status(500).json({ error: 'GITHUB_TOKEN is not set' });
+async function runGithubSync() {
+  if (!GITHUB_TOKEN) throw new Error('GITHUB_TOKEN is not set');
   try {
     const db = getPool();
     const items = await fetchProjectItems();
@@ -944,9 +943,27 @@ app.post('/api/admin/sync-github', async (req, res) => {
       await db.query('DELETE FROM implementations WHERE github_item_id IS NOT NULL');
     }
     const compCount = await db.query('SELECT COUNT(*)::int AS c FROM companies');
-    res.json({ success: true, synced: synced, skipped_hold_dead: skippedHoldDead, skipped_no_code: skippedNoCode, skipped_not_on_list: skippedNotOnList, companies: compCount.rows[0].c, comments_pulled: commentsPulled });
+    return { success: true, synced: synced, skipped_hold_dead: skippedHoldDead, skipped_no_code: skippedNoCode, skipped_not_on_list: skippedNotOnList, companies: compCount.rows[0].c, comments_pulled: commentsPulled };
   } catch (error) {
     console.error('GitHub sync error:', error);
+    throw error;
+  }
+}
+
+app.post('/api/admin/sync-github', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    res.json(await runGithubSync());
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Same sync, triggered by a signed-in admin from the Jobs page (JWT, no secret needed).
+app.post('/api/admin/sync-now', requireAdmin, async (req, res) => {
+  try {
+    res.json(await runGithubSync());
+  } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -1007,9 +1024,8 @@ async function claudeSummarize(db, impl, company, recentMessages, typical) {
   return parts.join(nl).trim();
 }
 
-app.post('/api/admin/run-summaries', async (req, res) => {
-  if (!checkSyncSecret(req, res)) return;
-  if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not set' });
+async function runSummaries() {
+  if (!ANTHROPIC_API_KEY) throw new Error('ANTHROPIC_API_KEY is not set');
   try {
     const db = getPool();
     const typical = await typicalDurations(db);
@@ -1039,9 +1055,27 @@ app.post('/api/admin/run-summaries', async (req, res) => {
         errors.push('impl ' + impl.id + ': ' + e.message);
       }
     }
-    res.json({ success: true, summarized: done, of: impls.rows.length, errors: errors });
+    return { success: true, summarized: done, of: impls.rows.length, errors: errors };
   } catch (error) {
     console.error('Summaries error:', error);
+    throw error;
+  }
+}
+
+app.post('/api/admin/run-summaries', async (req, res) => {
+  if (!checkSyncSecret(req, res)) return;
+  try {
+    res.json(await runSummaries());
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Same summaries, triggered by a signed-in admin from the Jobs page (JWT, no secret needed).
+app.post('/api/admin/run-summaries-now', requireAdmin, async (req, res) => {
+  try {
+    res.json(await runSummaries());
+  } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 });
