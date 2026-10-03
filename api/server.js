@@ -161,8 +161,8 @@ async function bootstrapAdmin() {
   const found = await db.query('SELECT id, password_hash FROM stewards WHERE LOWER(email) = LOWER($1) LIMIT 1', [ADMIN_EMAIL]);
   if (found.rows.length === 0) {
     const hash = await bcrypt.hash(ADMIN_PASSWORD, 10);
-    await db.query("INSERT INTO stewards (email, first_name, role, password_hash) VALUES ($1, $2, 'admin', $3)",
-      [ADMIN_EMAIL, 'Administrator', hash]);
+    await db.query("INSERT INTO stewards (email, name, first_name, role, password_hash) VALUES ($1, $2, $3, 'admin', $4)",
+      [ADMIN_EMAIL, 'Administrator', 'Administrator', hash]);
     console.log('Bootstrapped admin account: ' + ADMIN_EMAIL);
   } else if (!found.rows[0].password_hash) {
     const hash = await bcrypt.hash(ADMIN_PASSWORD, 10);
