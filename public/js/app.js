@@ -248,6 +248,15 @@ function statusBadge(status) {
   return '<span class="' + cls + '">' + esc(status || '') + '</span>';
 }
 
+// The status shown on tiles and the project view is the summary's RAG judgment
+// (RED/YELLOW/GREEN); the GitHub Priority badge is only a fallback when no
+// summary exists yet.
+function statusHtml(i) {
+  var rag = parseRag(i.latest_summary);
+  if (rag) return ragBadge(i.latest_summary);
+  return statusBadge(i.status);
+}
+
 function miniPipeline(current) {
   var idx = STAGES.indexOf(current);
   var html = '<div class="mini-pipe">';
@@ -265,7 +274,7 @@ function implCard(i) {
     '<div class="card-code">' + esc(i.company_code) + '</div>' +
     '<div class="card-title">' + esc(i.company_name) + '</div>' +
     miniPipeline(i.stage) +
-    '<div class="card-meta"><b>' + esc(i.stage || '') + '</b> ' + statusBadge(i.status) +
+    '<div class="card-meta"><b>' + esc(i.stage || '') + '</b> ' + statusHtml(i) +
     (i.days_in_stage !== null && i.days_in_stage !== undefined ? ' <span class="muted">&middot; ' + i.days_in_stage + ' days in stage</span>' : '') + '</div>' +
     (i.latest_summary ? '<div class="card-summary">' + esc(i.latest_summary.slice(0, 140)) + '&hellip;</div>' : '') +
     '</a>';
@@ -471,7 +480,7 @@ function viewProject(id) {
         ((i.ee_company_name || i.parent_company_name) ? '<p class="muted">' + esc(i.ee_company_name || i.parent_company_name) + '</p>' : '') +
         '<div class="proj-grid"><div>' +
         '<h3>Project lifecycle</h3>' + lifecycleVisual(i.stage, i.days_in_stage) +
-        '<p>' + statusBadge(i.status) + '</p>' +
+        '<p>' + statusHtml(i) + '</p>' +
         (i.card_title ? '<p class="muted">' + esc(i.card_title) + '</p>' : '') +
         '<h3>Project summary</h3>' + summaryHtml(latest) + older +
         '</div><div>' +
