@@ -233,6 +233,25 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--brand-blue)
 .alert-error { background: #fdecec; border: 1px solid var(--brand-red); color: #a11616; }
 .alert-ok { background: #ecfdf3; border: 1px solid #1a9e54; color: #0e6b36; }
 
+/* ---------- filters ---------- */
+.filterbar {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  align-items: center;
+  margin: 0 0 16px;
+}
+.filterbar input[type="search"] { max-width: 320px; margin-top: 0; }
+.filterbar select { width: auto; min-width: 180px; margin-top: 0; }
+
+/* ---------- mini pipeline (2nd page cards) ---------- */
+.mini-pipe { display: flex; gap: 4px; margin: 8px 0; }
+.mp-step { height: 8px; flex: 1; border-radius: 4px; background: #dfe5f0; }
+.mp-step.done { background: var(--brand-blue); }
+.mp-step.current { background: var(--brand-yellow); }
+
+.table-scroll { overflow-x: auto; }
+
 @media (max-width: 640px) {
   .topbar { flex-wrap: wrap; }
   .userbox { margin-left: 0; }

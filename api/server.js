@@ -1,8 +1,8 @@
-// iM4 Health Management System (Smart Hub) - v2
-// Full-replacement server. Roles: admin + steward (mutually exclusive).
-// Password auth (bcrypt) + JWT sessions. Password resets via Resend.
-// GitHub kanban mirror: board cards -> companies + implementations,
-// issue comments <-> project messages, Claude summaries Sun-Thu nights.
+// iM4 Health Management System (Smart Hub) - v3
+// Roles: admin + steward (mutually exclusive). Password auth (bcrypt) + JWT.
+// Stewards/Companies/Assignments are updated ONLY by admin CSV import.
+// Sync links kanban cards to companies already on the company list (by
+// 4-digit company code) — it never creates companies.
 
 const express = require('express');
 const cors = require('cors');
@@ -23,7 +23,6 @@ const SYNC_SECRET = process.env.SYNC_SECRET || '';
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN || '';
 const GITHUB_ORG = process.env.GITHUB_ORG || 'im4health-implementation';
 const GITHUB_PROJECT = parseInt(process.env.GITHUB_PROJECT || '3', 10);
-const GITHUB_REPO = process.env.GITHUB_REPO || 'im4health-implementation/Implementation';
 const GITHUB_POST_AS = process.env.GITHUB_POST_AS || 'FTJ Solutions';
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY || '';
 const ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || 'claude-haiku-4-5';
@@ -48,8 +47,6 @@ function getPool() {
   return pool;
 }
 
-// Every schema change goes through ADD COLUMN IF NOT EXISTS so deploys
-// never break against the live database.
 async function migrate() {
   const db = getPool();
   await db.query('CREATE TABLE IF NOT EXISTS companies (' +
@@ -96,6 +93,9 @@ async function migrate() {
   const cols = [
     ['stewards', 'role', "TEXT NOT NULL DEFAULT 'steward'"],
     ['stewards', 'password_hash', 'TEXT'],
+    ['stewards', 'first_name', 'TEXT'],
+    ['stewards', 'last_name', 'TEXT'],
+    ['stewards', 'phone', 'TEXT'],
     ['stewards', 'reset_token', 'TEXT'],
     ['stewards', 'reset_expires', 'TIMESTAMPTZ'],
     ['stewards', 'created_at', 'TIMESTAMPTZ DEFAULT NOW()'],
@@ -104,6 +104,7 @@ async function migrate() {
     ['companies', 'payroll_total', 'INT'],
     ['companies', 'payroll_ineligible', 'INT'],
     ['companies', 'payroll_opted_out', 'INT'],
+    ['companies', 'payroll_qualified', 'INT'],
     ['companies', 'payroll_enrolled', 'INT'],
     ['companies', 'payroll_not_enrolled', 'INT'],
     ['companies', 'payroll_new_qualified', 'INT'],
@@ -122,17 +123,20 @@ async function migrate() {
     await db.query('ALTER TABLE ' + table + ' ADD COLUMN IF NOT EXISTS ' + col + ' ' + def);
   }
   await db.query("UPDATE stewards SET role = 'steward' WHERE role IS NULL OR role = ''");
+  // Backfill first/last name from the old single name field where empty.
+  await db.query("UPDATE stewards SET first_name = SPLIT_PART(name, ' ', 1) " +
+    "WHERE (first_name IS NULL OR first_name = '') AND name IS NOT NULL AND name <> ''");
+  await db.query("UPDATE stewards SET last_name = NULLIF(SUBSTRING(name FROM POSITION(' ' IN name) + 1), '') " +
+    "WHERE (last_name IS NULL OR last_name = '') AND name IS NOT NULL AND POSITION(' ' IN name) > 0");
 }
 
-// First admin bootstrap: creates ADMIN_EMAIL as an admin on first run, or
-// fills in a missing password. Never overwrites an existing password hash.
 async function bootstrapAdmin() {
   if (!ADMIN_EMAIL || !ADMIN_PASSWORD) return;
   const db = getPool();
   const found = await db.query('SELECT id, password_hash FROM stewards WHERE LOWER(email) = LOWER($1) LIMIT 1', [ADMIN_EMAIL]);
   if (found.rows.length === 0) {
     const hash = await bcrypt.hash(ADMIN_PASSWORD, 10);
-    await db.query("INSERT INTO stewards (email, name, role, password_hash) VALUES ($1, $2, 'admin', $3)",
+    await db.query("INSERT INTO stewards (email, first_name, role, password_hash) VALUES ($1, $2, 'admin', $3)",
       [ADMIN_EMAIL, 'Administrator', hash]);
     console.log('Bootstrapped admin account: ' + ADMIN_EMAIL);
   } else if (!found.rows[0].password_hash) {
@@ -154,7 +158,7 @@ async function requireAuth(req, res, next) {
     const token = header.startsWith('Bearer ') ? header.slice(7) : null;
     if (!token) return res.status(401).json({ error: 'Not signed in' });
     const payload = jwt.verify(token, JWT_SECRET);
-    const r = await getPool().query('SELECT id, email, name, role FROM stewards WHERE id = $1 LIMIT 1', [payload.id]);
+    const r = await getPool().query('SELECT id, email, first_name, last_name, name, role FROM stewards WHERE id = $1 LIMIT 1', [payload.id]);
     if (r.rows.length === 0) return res.status(401).json({ error: 'Account no longer exists' });
     req.user = r.rows[0];
     next();
@@ -178,8 +182,19 @@ function checkSyncSecret(req, res) {
   return true;
 }
 
+function displayName(u) {
+  const full = [u.first_name, u.last_name].filter(Boolean).join(' ').trim();
+  return full || u.name || u.email;
+}
+
 function publicUser(u) {
-  return { id: u.id, email: u.email, name: u.name, role: u.role };
+  return { id: u.id, email: u.email, name: displayName(u), role: u.role };
+}
+
+function num(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = parseInt(v, 10);
+  return isNaN(n) ? null : n;
 }
 
 // ---------------------------------------------------------------- public
@@ -214,7 +229,6 @@ function baseUrl(req) {
 app.post('/api/auth/forgot', async (req, res) => {
   try {
     const { email } = req.body || {};
-    // Always respond the same way so accounts cannot be enumerated.
     const done = () => res.json({ success: true, message: 'If that email has an account, a reset link is on its way.' });
     if (!email) return done();
     const r = await getPool().query('SELECT id, email FROM stewards WHERE LOWER(email) = LOWER($1) LIMIT 1', [String(email).trim()]);
@@ -266,39 +280,13 @@ app.get('/api/me', requireAuth, (req, res) => {
   res.json(publicUser(req.user));
 });
 
-// ---------------------------------------------------------------- github
+// ---------------------------------------------------------------- github helpers
 function ghHeaders() {
   return {
     'Authorization': 'Bearer ' + GITHUB_TOKEN,
     'Content-Type': 'application/json',
     'User-Agent': 'im4-sync'
   };
-}
-
-async function fetchProjectItems() {
-  const query = `query($after: String) { organization(login: "im4health-implementation") { projectV2(number: 3) { items(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { id content { __typename ... on DraftIssue { title } ... on Issue { title number repository { nameWithOwner } } ... on PullRequest { title } } fieldValues(first: 25) { nodes { __typename ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } } ... on ProjectV2ItemFieldNumberValue { number field { ... on ProjectV2Field { name } } } } } } } } } }`;
-  const all = [];
-  let after = null;
-  for (;;) {
-    const resp = await fetch('https://api.github.com/graphql', {
-      method: 'POST',
-      headers: ghHeaders(),
-      body: JSON.stringify({ query: query, variables: { after: after } })
-    });
-    if (!resp.ok) throw new Error('GitHub API returned ' + resp.status);
-    const data = await resp.json();
-    if (data.errors) throw new Error('GitHub API: ' + data.errors[0].message);
-    const items = data.data.organization.projectV2.items;
-    for (const n of items.nodes) all.push(n);
-    if (!items.pageInfo.hasNextPage) break;
-    after = items.pageInfo.endCursor;
-  }
-  return all;
-}
-
-function slugify(name) {
-  const s = String(name || '').toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
-  return s || 'company';
 }
 
 async function fetchIssueComments(repo, issueNumber) {
@@ -325,7 +313,6 @@ async function postIssueComment(repo, issueNumber, body) {
   return resp.json();
 }
 
-// Companies visible to the caller: stewards see only assigned companies.
 async function visibleCompanyIds(user) {
   if (user.role === 'admin') return null;
   const r = await getPool().query('SELECT company_id FROM assignments WHERE steward_id = $1', [user.id]);
@@ -337,7 +324,14 @@ function numericCodeSort() {
     "CASE WHEN company_code ~ '^[0-9]+$' THEN company_code::int END NULLS LAST, company_code";
 }
 
-// ---------------------------------------------------------------- steward: clients
+// Qualified = stored value, else computed as total - ineligible - opted out.
+function qualifiedOf(c) {
+  if (c.payroll_qualified !== null && c.payroll_qualified !== undefined) return c.payroll_qualified;
+  if (c.payroll_total === null || c.payroll_total === undefined) return null;
+  return (c.payroll_total || 0) - (c.payroll_ineligible || 0) - (c.payroll_opted_out || 0);
+}
+
+// ---------------------------------------------------------------- steward: clients (payroll data only, no implementation data)
 app.get('/api/clients', requireAuth, async (req, res) => {
   try {
     const ids = await visibleCompanyIds(req.user);
@@ -348,13 +342,12 @@ app.get('/api/clients', requireAuth, async (req, res) => {
       where = 'WHERE c.id = ANY($1)';
       params.push(ids);
     }
-    const r = await getPool().query(
-      'SELECT c.*, i.stage, i.status, i.id AS implementation_id, ' +
-      '(SELECT COUNT(*)::int FROM assignments a WHERE a.company_id = c.id) AS steward_count, ' +
-      '(SELECT COUNT(*)::int FROM implementations x WHERE x.company_id = c.id) AS implementation_count ' +
-      'FROM companies c LEFT JOIN LATERAL ' +
-      '(SELECT * FROM implementations WHERE company_id = c.id ORDER BY updated_at DESC LIMIT 1) i ON true ' +
-      where + ' ' + numericCodeSort(), params);
+    const q = req.query.q ? String(req.query.q).toLowerCase() : '';
+    if (q) {
+      params.push('%' + q + '%');
+      where += (where ? ' AND ' : 'WHERE ') + '(LOWER(c.company_code) LIKE $' + params.length + ' OR LOWER(c.company_name) LIKE $' + params.length + ')';
+    }
+    const r = await getPool().query('SELECT * FROM companies c ' + where + ' ' + numericCodeSort(), params);
     res.json(r.rows);
   } catch (error) {
     console.error('Load clients error:', error);
@@ -371,10 +364,12 @@ app.get('/api/clients/:id', requireAuth, async (req, res) => {
     const c = await getPool().query('SELECT * FROM companies WHERE id = $1', [req.params.id]);
     if (c.rows.length === 0) return res.status(404).json({ error: 'Client not found' });
     const impls = await getPool().query(
-      'SELECT i.*, (SELECT COUNT(*)::int FROM messages m WHERE m.implementation_id = i.id) AS message_count ' +
-      'FROM implementations i WHERE i.company_id = $1 ORDER BY i.id', [req.params.id]);
+      'SELECT i.*, EXTRACT(DAY FROM (NOW() - i.updated_at))::int AS days_in_stage, ' +
+      '(SELECT COUNT(*)::int FROM messages m WHERE m.implementation_id = i.id) AS message_count, ' +
+      '(SELECT body FROM implementation_summaries s WHERE s.implementation_id = i.id ORDER BY s.summary_date DESC LIMIT 1) AS latest_summary ' +
+      'FROM implementations i WHERE i.company_id = $1 ORDER BY i.updated_at DESC', [req.params.id]);
     const stewards = await getPool().query(
-      'SELECT s.id, s.name, s.email FROM stewards s JOIN assignments a ON a.steward_id = s.id WHERE a.company_id = $1 ORDER BY s.name',
+      'SELECT s.id, s.first_name, s.last_name, s.name, s.email FROM stewards s JOIN assignments a ON a.steward_id = s.id WHERE a.company_id = $1 ORDER BY s.id',
       [req.params.id]);
     res.json({ company: c.rows[0], implementations: impls.rows, stewards: stewards.rows });
   } catch (error) {
@@ -383,7 +378,7 @@ app.get('/api/clients/:id', requireAuth, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------- steward: implementations
+// ---------------------------------------------------------------- steward: implementations (implementation data only)
 app.get('/api/implementations', requireAuth, async (req, res) => {
   try {
     const ids = await visibleCompanyIds(req.user);
@@ -394,6 +389,17 @@ app.get('/api/implementations', requireAuth, async (req, res) => {
       where = 'WHERE i.company_id = ANY($1)';
       params.push(ids);
     }
+    const clauses = [];
+    if (req.query.stage) {
+      params.push(String(req.query.stage));
+      clauses.push('i.stage = $' + params.length);
+    }
+    const q = req.query.q ? String(req.query.q).toLowerCase() : '';
+    if (q) {
+      params.push('%' + q + '%');
+      clauses.push('(LOWER(c.company_code) LIKE $' + params.length + ' OR LOWER(c.company_name) LIKE $' + params.length + ')');
+    }
+    if (clauses.length > 0) where += (where ? ' AND ' : 'WHERE ') + clauses.join(' AND ');
     const r = await getPool().query(
       'SELECT i.*, c.company_code, c.company_name, ' +
       'EXTRACT(DAY FROM (NOW() - i.updated_at))::int AS days_in_stage, ' +
@@ -412,28 +418,30 @@ app.get('/api/implementations/:id', requireAuth, async (req, res) => {
     const ids = await visibleCompanyIds(req.user);
     const r = await getPool().query(
       'SELECT i.*, c.company_code, c.company_name, c.payroll_total, c.payroll_ineligible, c.payroll_opted_out, ' +
-      'c.payroll_enrolled, c.payroll_not_enrolled, c.payroll_new_qualified, c.payroll_dataset_date, ' +
+      'c.payroll_qualified, c.payroll_enrolled, c.payroll_not_enrolled, c.payroll_new_qualified, c.payroll_dataset_date, ' +
       'EXTRACT(DAY FROM (NOW() - i.updated_at))::int AS days_in_stage ' +
       'FROM implementations i JOIN companies c ON c.id = i.company_id WHERE i.id = $1', [req.params.id]);
     if (r.rows.length === 0) return res.status(404).json({ error: 'Not found' });
     if (ids && ids.indexOf(r.rows[0].company_id) === -1) {
       return res.status(403).json({ error: 'Not assigned to this client' });
     }
+    const impl = r.rows[0];
     const msgs = await getPool().query(
-      'SELECT m.*, s.name AS steward_name FROM messages m LEFT JOIN stewards s ON s.id = m.steward_id ' +
+      'SELECT m.*, s.first_name, s.last_name, s.name AS steward_legacy_name FROM messages m LEFT JOIN stewards s ON s.id = m.steward_id ' +
       'WHERE m.implementation_id = $1 ORDER BY COALESCE(m.github_created_at, m.created_at)',
       [req.params.id]);
     const sums = await getPool().query(
       'SELECT summary_date, body, created_at FROM implementation_summaries WHERE implementation_id = $1 ORDER BY summary_date DESC LIMIT 5',
       [req.params.id]);
-    res.json({ implementation: r.rows[0], messages: msgs.rows, summaries: sums.rows });
+    const github_url = (impl.github_repo && impl.github_issue_number)
+      ? 'https://github.com/' + impl.github_repo + '/issues/' + impl.github_issue_number : null;
+    res.json({ implementation: impl, messages: msgs.rows, summaries: sums.rows, github_url: github_url });
   } catch (error) {
     console.error('Load project error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Steward posts a message: goes to the GitHub issue card AND into the app.
 app.post('/api/implementations/:id/messages', requireAuth, async (req, res) => {
   try {
     const { body } = req.body || {};
@@ -445,8 +453,9 @@ app.post('/api/implementations/:id/messages', requireAuth, async (req, res) => {
     if (ids && ids.indexOf(impl.company_id) === -1) {
       return res.status(403).json({ error: 'Not assigned to this client' });
     }
-    const stewardName = req.user.name || req.user.email;
-    const ghBody = ['**' + stewardName + '** (via ' + GITHUB_POST_AS + ')', '', String(body).trim()].join(String.fromCharCode(10, 10));
+    const stewardName = displayName(req.user);
+    const nl = String.fromCharCode(10);
+    const ghBody = '**' + stewardName + '** (via ' + GITHUB_POST_AS + ')' + nl + nl + String(body).trim();
     let ghComment = null;
     if (GITHUB_TOKEN && impl.github_repo && impl.github_issue_number) {
       ghComment = await postIssueComment(impl.github_repo, impl.github_issue_number, ghBody);
@@ -462,11 +471,11 @@ app.post('/api/implementations/:id/messages', requireAuth, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------- admin: stewards
+// ---------------------------------------------------------------- admin: stewards (read-only list; import only; password set)
 app.get('/api/admin/stewards', requireAdmin, async (req, res) => {
   try {
     const r = await getPool().query(
-      "SELECT id, email, name, role, created_at FROM stewards ORDER BY CASE WHEN role = 'admin' THEN 0 ELSE 1 END, name");
+      "SELECT id, email, first_name, last_name, name, phone, role, created_at FROM stewards ORDER BY CASE WHEN role = 'admin' THEN 0 ELSE 1 END, id");
     res.json(r.rows);
   } catch (error) {
     console.error('Admin stewards error:', error);
@@ -474,80 +483,28 @@ app.get('/api/admin/stewards', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/stewards', requireAdmin, async (req, res) => {
+// Admin sets (or resets) a steward's password directly. Everything else
+// about the steward record comes from the CSV import.
+app.post('/api/admin/stewards/:id/password', requireAdmin, async (req, res) => {
   try {
-    const { email, name, password, role } = req.body || {};
-    if (!email || !String(email).includes('@')) return res.status(400).json({ error: 'A valid email is required' });
-    if (!password || String(password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
-    const rRole = role === 'admin' ? 'admin' : 'steward';
+    const { password } = req.body || {};
+    if (!password || String(password).length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
     const hash = await bcrypt.hash(String(password), 10);
-    const r = await getPool().query(
-      'INSERT INTO stewards (email, name, role, password_hash) VALUES ($1, $2, $3, $4) RETURNING id, email, name, role',
-      [String(email).trim().toLowerCase(), name || null, rRole, hash]);
-    res.status(201).json(r.rows[0]);
-  } catch (error) {
-    if (error.code === '23505') return res.status(409).json({ error: 'That email is already in use' });
-    console.error('Admin create steward error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.put('/api/admin/stewards/:id', requireAdmin, async (req, res) => {
-  try {
-    const { name, email, role, password } = req.body || {};
-    const cur = await getPool().query('SELECT * FROM stewards WHERE id = $1', [req.params.id]);
-    if (cur.rows.length === 0) return res.status(404).json({ error: 'Not found' });
-    if (String(cur.rows[0].id) === String(req.user.id) && role && role !== 'admin') {
-      return res.status(400).json({ error: 'You cannot remove your own admin role' });
-    }
-    const updates = [];
-    const params = [];
-    if (name !== undefined) { params.push(name || null); updates.push('name = $' + params.length); }
-    if (email && String(email).includes('@')) { params.push(String(email).trim().toLowerCase()); updates.push('email = $' + params.length); }
-    if (role === 'admin' || role === 'steward') { params.push(role); updates.push('role = $' + params.length); }
-    if (password) {
-      if (String(password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
-      params.push(await bcrypt.hash(String(password), 10));
-      updates.push('password_hash = $' + params.length);
-    }
-    if (updates.length === 0) return res.status(400).json({ error: 'Nothing to update' });
-    params.push(req.params.id);
-    const r = await getPool().query(
-      'UPDATE stewards SET ' + updates.join(', ') + ' WHERE id = $' + params.length + ' RETURNING id, email, name, role',
-      params);
-    res.json(r.rows[0]);
-  } catch (error) {
-    if (error.code === '23505') return res.status(409).json({ error: 'That email is already in use' });
-    console.error('Admin update steward error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.delete('/api/admin/stewards/:id', requireAdmin, async (req, res) => {
-  try {
-    if (String(req.params.id) === String(req.user.id)) {
-      return res.status(400).json({ error: 'You cannot delete your own account' });
-    }
-    const linked = await getPool().query('SELECT COUNT(*)::int AS c FROM assignments WHERE steward_id = $1', [req.params.id]);
-    if (linked.rows[0].c > 0) {
-      return res.status(409).json({ error: 'Cannot delete: this person is assigned to ' + linked.rows[0].c + ' companie(s). Remove the assignments first.' });
-    }
-    const r = await getPool().query('DELETE FROM stewards WHERE id = $1 RETURNING id', [req.params.id]);
+    const r = await getPool().query('UPDATE stewards SET password_hash = $1 WHERE id = $2 RETURNING id', [hash, req.params.id]);
     if (r.rows.length === 0) return res.status(404).json({ error: 'Not found' });
     res.json({ success: true });
   } catch (error) {
-    console.error('Admin delete steward error:', error);
+    console.error('Admin set password error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// ---------------------------------------------------------------- admin: companies
+// ---------------------------------------------------------------- admin: companies (read-only list; import only)
 app.get('/api/admin/companies', requireAdmin, async (req, res) => {
   try {
-    const r = await getPool().query(
-      'SELECT c.*, (SELECT COUNT(*)::int FROM assignments a WHERE a.company_id = c.id) AS steward_count, ' +
-      '(SELECT COUNT(*)::int FROM implementations i WHERE i.company_id = c.id) AS implementation_count ' +
-      'FROM companies c ' + numericCodeSort());
+    const r = await getPool().query('SELECT * FROM companies c ' + numericCodeSort());
     res.json(r.rows);
   } catch (error) {
     console.error('Admin companies error:', error);
@@ -555,73 +512,13 @@ app.get('/api/admin/companies', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/companies', requireAdmin, async (req, res) => {
-  try {
-    const b = req.body || {};
-    if (!b.company_code || !b.company_name) return res.status(400).json({ error: 'company_code and company_name are required' });
-    const r = await getPool().query(
-      'INSERT INTO companies (company_code, company_name, payroll_total, payroll_ineligible, payroll_opted_out, payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date) ' +
-      'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *',
-      [String(b.company_code).trim(), String(b.company_name).trim(), num(b.payroll_total), num(b.payroll_ineligible),
-        num(b.payroll_opted_out), num(b.payroll_enrolled), num(b.payroll_not_enrolled), num(b.payroll_new_qualified),
-        b.payroll_dataset_date || null]);
-    res.status(201).json(r.rows[0]);
-  } catch (error) {
-    if (error.code === '23505') return res.status(409).json({ error: 'That company code is already in use' });
-    console.error('Admin create company error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-function num(v) {
-  if (v === undefined || v === null || v === '') return null;
-  const n = parseInt(v, 10);
-  return isNaN(n) ? null : n;
-}
-
-app.put('/api/admin/companies/:id', requireAdmin, async (req, res) => {
-  try {
-    const b = req.body || {};
-    const r = await getPool().query(
-      'UPDATE companies SET company_code = COALESCE($1, company_code), company_name = COALESCE($2, company_name), ' +
-      'payroll_total = $3, payroll_ineligible = $4, payroll_opted_out = $5, payroll_enrolled = $6, ' +
-      'payroll_not_enrolled = $7, payroll_new_qualified = $8, payroll_dataset_date = $9 WHERE id = $10 RETURNING *',
-      [b.company_code ? String(b.company_code).trim() : null, b.company_name ? String(b.company_name).trim() : null,
-        num(b.payroll_total), num(b.payroll_ineligible), num(b.payroll_opted_out), num(b.payroll_enrolled),
-        num(b.payroll_not_enrolled), num(b.payroll_new_qualified), b.payroll_dataset_date || null, req.params.id]);
-    if (r.rows.length === 0) return res.status(404).json({ error: 'Not found' });
-    res.json(r.rows[0]);
-  } catch (error) {
-    if (error.code === '23505') return res.status(409).json({ error: 'That company code is already in use' });
-    console.error('Admin update company error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.delete('/api/admin/companies/:id', requireAdmin, async (req, res) => {
-  try {
-    const a = await getPool().query('SELECT COUNT(*)::int AS c FROM assignments WHERE company_id = $1', [req.params.id]);
-    const i = await getPool().query('SELECT COUNT(*)::int AS c FROM implementations WHERE company_id = $1', [req.params.id]);
-    if (a.rows[0].c > 0 || i.rows[0].c > 0) {
-      return res.status(409).json({ error: 'Cannot delete: this company has linked assignments/implementations. Remove them first.' });
-    }
-    const r = await getPool().query('DELETE FROM companies WHERE id = $1 RETURNING id', [req.params.id]);
-    if (r.rows.length === 0) return res.status(404).json({ error: 'Not found' });
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Admin delete company error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// ---------------------------------------------------------------- admin: assignments
+// ---------------------------------------------------------------- admin: assignments (read-only list; import only)
 app.get('/api/admin/assignments', requireAdmin, async (req, res) => {
   try {
     const r = await getPool().query(
-      'SELECT a.id, a.steward_id, a.company_id, s.email AS steward_email, s.name AS steward_name, ' +
-      'c.company_code, c.company_name FROM assignments a ' +
-      'JOIN stewards s ON s.id = a.steward_id JOIN companies c ON c.id = a.company_id ' +
-      'ORDER BY c.company_name, s.email');
+      'SELECT a.id, a.steward_id, c.company_code, s.email AS steward_email ' +
+      'FROM assignments a JOIN stewards s ON s.id = a.steward_id JOIN companies c ON c.id = a.company_id ' +
+      'ORDER BY a.steward_id, c.company_code');
     res.json(r.rows);
   } catch (error) {
     console.error('Admin assignments error:', error);
@@ -629,31 +526,12 @@ app.get('/api/admin/assignments', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/assignments', requireAdmin, async (req, res) => {
-  try {
-    const { steward_id, company_id } = req.body || {};
-    if (!steward_id || !company_id) return res.status(400).json({ error: 'steward_id and company_id are required' });
-    const r = await getPool().query(
-      'INSERT INTO assignments (steward_id, company_id) VALUES ($1, $2) ON CONFLICT DO NOTHING RETURNING *',
-      [steward_id, company_id]);
-    res.status(201).json(r.rows[0] || { success: true, note: 'already assigned' });
-  } catch (error) {
-    console.error('Admin create assignment error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.delete('/api/admin/assignments/:id', requireAdmin, async (req, res) => {
-  try {
-    await getPool().query('DELETE FROM assignments WHERE id = $1', [req.params.id]);
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Admin delete assignment error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// ---------------------------------------------------------------- admin: imports (two-step)
+// ---------------------------------------------------------------- admin: import (the ONLY way to update these tables)
+// stewards:    email, first_name, last_name, phone, role (admin|steward)
+// companies:   company_code, company_name, payroll_total, payroll_ineligible,
+//              payroll_opted_out, payroll_qualified, payroll_enrolled,
+//              payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date
+// assignments: steward_id (or steward_email), company_code
 function validateImport(type, rows) {
   const errors = [];
   const valid = [];
@@ -666,7 +544,8 @@ function validateImport(type, rows) {
       const key = String(row.email).trim().toLowerCase();
       if (seen[key]) { e('duplicate email in file'); return; }
       seen[key] = true;
-      valid.push({ email: key, name: row.name || null });
+      const role = String(row.role || 'steward').trim().toLowerCase() === 'admin' ? 'admin' : 'steward';
+      valid.push({ email: key, first_name: row.first_name || null, last_name: row.last_name || null, phone: row.phone || null, role: role });
     } else if (type === 'companies') {
       if (!row.company_code) { e('company_code is required'); return; }
       if (!row.company_name) { e('company_name is required'); return; }
@@ -676,16 +555,18 @@ function validateImport(type, rows) {
       valid.push({
         company_code: key, company_name: String(row.company_name).trim(),
         payroll_total: num(row.payroll_total), payroll_ineligible: num(row.payroll_ineligible),
-        payroll_opted_out: num(row.payroll_opted_out), payroll_enrolled: num(row.payroll_enrolled),
-        payroll_not_enrolled: num(row.payroll_not_enrolled), payroll_new_qualified: num(row.payroll_new_qualified),
+        payroll_opted_out: num(row.payroll_opted_out), payroll_qualified: num(row.payroll_qualified),
+        payroll_enrolled: num(row.payroll_enrolled), payroll_not_enrolled: num(row.payroll_not_enrolled),
+        payroll_new_qualified: num(row.payroll_new_qualified),
         payroll_dataset_date: row.payroll_dataset_date || null
       });
     } else if (type === 'assignments') {
-      if (!row.steward_email || !row.company_code) { e('steward_email and company_code are required'); return; }
-      const key = String(row.steward_email).trim().toLowerCase() + '|' + String(row.company_code).trim();
+      const sid = row.steward_id || row.steward_email;
+      if (!sid || !row.company_code) { e('steward_id (or steward_email) and company_code are required'); return; }
+      const key = String(sid).trim().toLowerCase() + '|' + String(row.company_code).trim();
       if (seen[key]) { e('duplicate assignment in file'); return; }
       seen[key] = true;
-      valid.push({ steward_email: String(row.steward_email).trim().toLowerCase(), company_code: String(row.company_code).trim() });
+      valid.push({ steward_ref: String(sid).trim(), company_code: String(row.company_code).trim() });
     } else {
       e('unknown import type');
     }
@@ -697,7 +578,7 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
   try {
     const { type, rows, dry_run } = req.body || {};
     if (['stewards', 'companies', 'assignments'].indexOf(type) === -1) {
-      return res.status(400).json({ error: "type must be stewards, companies, or assignments" });
+      return res.status(400).json({ error: 'type must be stewards, companies, or assignments' });
     }
     if (!Array.isArray(rows) || rows.length === 0) return res.status(400).json({ error: 'rows array is required' });
     const v = validateImport(type, rows);
@@ -710,28 +591,49 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
     if (type === 'stewards') {
       for (const s of v.valid) {
         try {
-          await db.query("INSERT INTO stewards (email, name, role) VALUES ($1, $2, 'steward') ON CONFLICT (email) DO NOTHING", [s.email, s.name]);
+          // Never let an import strip the requesting admin's own admin role.
+          const selfRow = await db.query('SELECT id FROM stewards WHERE LOWER(email) = LOWER($1)', [s.email]);
+          let role = s.role;
+          if (selfRow.rows.length > 0 && String(selfRow.rows[0].id) === String(req.user.id) && role !== 'admin') {
+            role = 'admin';
+          }
+          await db.query(
+            'INSERT INTO stewards (email, first_name, last_name, phone, role) VALUES ($1, $2, $3, $4, $5) ' +
+            'ON CONFLICT (email) DO UPDATE SET first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name, ' +
+            'phone = EXCLUDED.phone, role = EXCLUDED.role',
+            [s.email, s.first_name, s.last_name, s.phone, role]);
           imported++;
-        } catch (e) { commitErrors.push(s.email + ': ' + e.message); }
+        } catch (err) { commitErrors.push(s.email + ': ' + err.message); }
       }
     } else if (type === 'companies') {
       for (const c of v.valid) {
         try {
-          await db.query('INSERT INTO companies (company_code, company_name, payroll_total, payroll_ineligible, payroll_opted_out, payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, payroll_total = EXCLUDED.payroll_total, payroll_ineligible = EXCLUDED.payroll_ineligible, payroll_opted_out = EXCLUDED.payroll_opted_out, payroll_enrolled = EXCLUDED.payroll_enrolled, payroll_not_enrolled = EXCLUDED.payroll_not_enrolled, payroll_new_qualified = EXCLUDED.payroll_new_qualified, payroll_dataset_date = EXCLUDED.payroll_dataset_date',
-            [c.company_code, c.company_name, c.payroll_total, c.payroll_ineligible, c.payroll_opted_out, c.payroll_enrolled, c.payroll_not_enrolled, c.payroll_new_qualified, c.payroll_dataset_date]);
+          await db.query(
+            'INSERT INTO companies (company_code, company_name, payroll_total, payroll_ineligible, payroll_opted_out, ' +
+            'payroll_qualified, payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date) ' +
+            'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ' +
+            'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, ' +
+            'payroll_total = EXCLUDED.payroll_total, payroll_ineligible = EXCLUDED.payroll_ineligible, ' +
+            'payroll_opted_out = EXCLUDED.payroll_opted_out, payroll_qualified = EXCLUDED.payroll_qualified, ' +
+            'payroll_enrolled = EXCLUDED.payroll_enrolled, payroll_not_enrolled = EXCLUDED.payroll_not_enrolled, ' +
+            'payroll_new_qualified = EXCLUDED.payroll_new_qualified, payroll_dataset_date = EXCLUDED.payroll_dataset_date',
+            [c.company_code, c.company_name, c.payroll_total, c.payroll_ineligible, c.payroll_opted_out,
+              c.payroll_qualified, c.payroll_enrolled, c.payroll_not_enrolled, c.payroll_new_qualified, c.payroll_dataset_date]);
           imported++;
-        } catch (e) { commitErrors.push(c.company_code + ': ' + e.message); }
+        } catch (err) { commitErrors.push(c.company_code + ': ' + err.message); }
       }
     } else {
-      const sMap = {};
+      const byEmail = {};
+      const byId = {};
+      (await db.query('SELECT id, LOWER(email) AS email FROM stewards')).rows.forEach(x => { byEmail[x.email] = x.id; byId[String(x.id)] = x.id; });
       const cMap = {};
-      (await db.query('SELECT id, LOWER(email) AS email FROM stewards')).rows.forEach(x => { sMap[x.email] = x.id; });
       (await db.query('SELECT id, company_code FROM companies')).rows.forEach(x => { cMap[x.company_code] = x.id; });
       for (const a of v.valid) {
-        const sid = sMap[a.steward_email];
+        const ref = a.steward_ref.toLowerCase();
+        const sid = byId[a.steward_ref] || byEmail[ref];
         const cid = cMap[a.company_code];
-        if (!sid) { commitErrors.push(a.steward_email + ': steward not found'); continue; }
-        if (!cid) { commitErrors.push(a.company_code + ': company not found'); continue; }
+        if (!sid) { commitErrors.push(a.steward_ref + ': steward not found'); continue; }
+        if (!cid) { commitErrors.push(a.company_code + ': company not found (is it on the company list?)'); continue; }
         await db.query('INSERT INTO assignments (steward_id, company_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [sid, cid]);
         imported++;
       }
@@ -743,11 +645,35 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------- github mirror sync
-// Board cards -> companies + implementations. Hold/Dead skipped.
+// ---------------------------------------------------------------- github mirror sync (link-only)
+// Board cards -> implementations, but ONLY for companies already on the
+// company list (matched by 4-digit company code). The sync never creates
+// companies. Cards without a code, or with a code not on the list, are
+// skipped. Implementations whose card is gone (or no longer matches) are
+// removed: a tile exists iff the company is on the list AND on the kanban.
 // Then pulls each linked issue's comments into messages.
-// Protected by x-sync-secret. Keeps the 6-hour cron contract:
-// { success, synced, skipped_hold_dead, companies }.
+// Protected by x-sync-secret.
+async function fetchProjectItems() {
+  const query = `query($after: String) { organization(login: "` + GITHUB_ORG + `") { projectV2(number: ` + GITHUB_PROJECT + `) { items(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { id content { __typename ... on DraftIssue { title } ... on Issue { title number repository { nameWithOwner } } ... on PullRequest { title } } fieldValues(first: 25) { nodes { __typename ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } } ... on ProjectV2ItemFieldNumberValue { number field { ... on ProjectV2Field { name } } } } } } } } } }`;
+  const all = [];
+  let after = null;
+  for (;;) {
+    const resp = await fetch('https://api.github.com/graphql', {
+      method: 'POST',
+      headers: ghHeaders(),
+      body: JSON.stringify({ query: query, variables: { after: after } })
+    });
+    if (!resp.ok) throw new Error('GitHub API returned ' + resp.status);
+    const data = await resp.json();
+    if (data.errors) throw new Error('GitHub API: ' + data.errors[0].message);
+    const items = data.data.organization.projectV2.items;
+    for (const n of items.nodes) all.push(n);
+    if (!items.pageInfo.hasNextPage) break;
+    after = items.pageInfo.endCursor;
+  }
+  return all;
+}
+
 app.post('/api/admin/sync-github', async (req, res) => {
   if (!checkSyncSecret(req, res)) return;
   if (!GITHUB_TOKEN) return res.status(500).json({ error: 'GITHUB_TOKEN is not set' });
@@ -755,9 +681,11 @@ app.post('/api/admin/sync-github', async (req, res) => {
     const db = getPool();
     const items = await fetchProjectItems();
     let synced = 0;
-    let skipped = 0;
+    let skippedHoldDead = 0;
+    let skippedNoCode = 0;
+    let skippedNotOnList = 0;
     let commentsPulled = 0;
-    const activeIds = [];
+    const syncedIds = [];
     for (const item of items) {
       const fields = {};
       for (const v of item.fieldValues.nodes) {
@@ -765,29 +693,14 @@ app.post('/api/admin/sync-github', async (req, res) => {
         else if (v.__typename === 'ProjectV2ItemFieldNumberValue') fields[v.field.name] = v.number;
       }
       const status = fields['Status'] || '';
-      if (status === 'Hold' || status === 'Dead') { skipped++; continue; }
+      if (status === 'Hold' || status === 'Dead') { skippedHoldDead++; continue; }
+      const codeRaw = fields['Company Code'];
+      if (codeRaw === undefined || codeRaw === null) { skippedNoCode++; continue; }
+      const code = String(Math.trunc(codeRaw));
+      const comp = await db.query('SELECT id, company_name FROM companies WHERE company_code = $1', [code]);
+      if (comp.rows.length === 0) { skippedNotOnList++; continue; }
+      const companyId = comp.rows[0].id;
       const fullTitle = (item.content && item.content.title) ? item.content.title : 'Untitled';
-      const companyName = fullTitle.split(';')[0].trim() || 'Unnamed Company';
-      // Company code: the board's "Company Code" number field wins; slug fallback.
-      const boardCode = (fields['Company Code'] !== undefined && fields['Company Code'] !== null)
-        ? String(Math.trunc(fields['Company Code'])) : null;
-      const code = boardCode || slugify(companyName);
-      // Find the company: by code first, then migrate a slug row by name match.
-      let comp = await db.query('SELECT id FROM companies WHERE company_code = $1', [code]);
-      if (comp.rows.length === 0 && boardCode) {
-        comp = await db.query('SELECT id FROM companies WHERE LOWER(company_name) = LOWER($1)', [companyName]);
-        if (comp.rows.length > 0) {
-          await db.query('UPDATE companies SET company_code = $1 WHERE id = $2', [code, comp.rows[0].id]);
-        }
-      }
-      let companyId;
-      if (comp.rows.length > 0) {
-        companyId = comp.rows[0].id;
-        await db.query('UPDATE companies SET company_name = $1 WHERE id = $2', [companyName, companyId]);
-      } else {
-        const ins = await db.query('INSERT INTO companies (company_code, company_name) VALUES ($1, $2) RETURNING id', [code, companyName]);
-        companyId = ins.rows[0].id;
-      }
       const issueNumber = (item.content && item.content.__typename === 'Issue') ? item.content.number : null;
       const repo = (item.content && item.content.repository) ? item.content.repository.nameWithOwner : null;
       await db.query(
@@ -799,9 +712,8 @@ app.post('/api/admin/sync-github', async (req, res) => {
         'payroll_frequency = EXCLUDED.payroll_frequency, updated_at = NOW()',
         [companyId, status || 'No Status', fields['Priority'] || 'NORMAL', item.id, issueNumber, repo,
           fullTitle, fields['Payroll Provider'] || null, fields['Payroll Frequency'] || null]);
-      activeIds.push(item.id);
+      syncedIds.push(item.id);
       synced++;
-      // Pull comments for this issue into messages.
       if (issueNumber && repo) {
         try {
           const impl = await db.query('SELECT id FROM implementations WHERE github_item_id = $1', [item.id]);
@@ -820,11 +732,14 @@ app.post('/api/admin/sync-github', async (req, res) => {
         }
       }
     }
-    if (activeIds.length > 0) {
-      await db.query('DELETE FROM implementations WHERE github_item_id IS NOT NULL AND NOT (github_item_id = ANY($1))', [activeIds]);
+    // Tiles exist iff on the company list AND on the kanban: drop the rest.
+    if (syncedIds.length > 0) {
+      await db.query('DELETE FROM implementations WHERE github_item_id IS NOT NULL AND NOT (github_item_id = ANY($1))', [syncedIds]);
+    } else {
+      await db.query('DELETE FROM implementations WHERE github_item_id IS NOT NULL');
     }
     const compCount = await db.query('SELECT COUNT(*)::int AS c FROM companies');
-    res.json({ success: true, synced: synced, skipped_hold_dead: skipped, companies: compCount.rows[0].c, comments_pulled: commentsPulled });
+    res.json({ success: true, synced: synced, skipped_hold_dead: skippedHoldDead, skipped_no_code: skippedNoCode, skipped_not_on_list: skippedNotOnList, companies: compCount.rows[0].c, comments_pulled: commentsPulled });
   } catch (error) {
     console.error('GitHub sync error:', error);
     res.status(500).json({ success: false, error: error.message });
