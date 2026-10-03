@@ -610,7 +610,7 @@ function parseCSV(text) {
 
 var IMPORT_FORMATS = {
   stewards: 'steward_id, email, first_name, last_name, phone, password (8+ chars; blank keeps the existing password; everyone imported here is a steward)',
-  companies: 'company_code, company_name, ee_company_code, ee_company_name, payroll_total, payroll_ineligible, payroll_opted_out, payroll_qualified, payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date (YYYY-MM-DD)',
+  companies: 'company_code, company_name, ee_company_code, ee_company_name, payroll_total (or ee_total), payroll_ineligible (or ee_ineligible), payroll_opted_out (or ee_optedout), payroll_qualified (or ee_qualified), payroll_enrolled (or ee_enrolled), payroll_not_enrolled (or ee_not_enrolled), payroll_new_qualified (or ee_new_qualified), payroll_dataset_date (or ee_dataset_date, YYYY-MM-DD). Headers are case-insensitive.',
   assignments: 'steward_id, company_code'
 };
 

@@ -641,7 +641,36 @@ app.get('/api/admin/assignments', requireAdmin, async (req, res) => {
 //              payroll_total, payroll_ineligible, payroll_opted_out, payroll_qualified,
 //              payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date
 // assignments: steward_id, company_code
+// Header normalization: lowercase, strip "(...)" notes, and accept the ee_*
+// payroll aliases (ee_total, ee_ineligible, ee_optedout, ee_qualified,
+// ee_enrolled, ee_not_enrolled, ee_new_qualified, ee_dataset_date).
+function normalizeRow(row) {
+  const n = {};
+  Object.keys(row).forEach(function (k) {
+    let key = String(k).toLowerCase().trim();
+    const paren = key.indexOf('(');
+    if (paren !== -1) key = key.slice(0, paren).trim();
+    n[key] = row[k];
+  });
+  const aliases = {
+    'ee_total': 'payroll_total',
+    'ee_ineligible': 'payroll_ineligible',
+    'ee_optedout': 'payroll_opted_out',
+    'ee_opted_out': 'payroll_opted_out',
+    'ee_qualified': 'payroll_qualified',
+    'ee_enrolled': 'payroll_enrolled',
+    'ee_not_enrolled': 'payroll_not_enrolled',
+    'ee_new_qualified': 'payroll_new_qualified',
+    'ee_dataset_date': 'payroll_dataset_date'
+  };
+  Object.keys(aliases).forEach(function (a) {
+    if (n[a] !== undefined && n[aliases[a]] === undefined) n[aliases[a]] = n[a];
+  });
+  return n;
+}
+
 function validateImport(type, rows) {
+  rows = rows.map(normalizeRow);
   const errors = [];
   const valid = [];
   const seen = {};
