@@ -676,6 +676,9 @@ function viewAdminJobs() {
       '<div class="card"><div class="card-title">GitHub kanban sync</div>' +
       '<p class="muted">Pulls board cards, links implementations, pulls comments, removes app copies of comments deleted on GitHub.</p>' +
       '<button class="btn btn-primary" id="runsync">Run sync now</button><div id="syncout"></div></div>' +
+      '<div class="card"><div class="card-title">Message sync</div>' +
+      '<p class="muted">Pulls GitHub comments and removes app copies of deleted comments. Lighter than the full sync.</p>' +
+      '<button class="btn btn-primary" id="runmsg">Sync messages now</button><div id="msgout"></div></div>' +
       '<div class="card"><div class="card-title">Claude project summaries</div>' +
       '<p class="muted">Generates fresh summaries for every active implementation.</p>' +
       '<button class="btn btn-primary" id="runsum">Run summaries now</button><div id="sumout"></div></div>' +
@@ -689,6 +692,15 @@ function viewAdminJobs() {
       out.innerHTML = '<p class="muted">Running...</p>';
       api.post('/api/admin/sync-now', {}).then(function (d) {
         out.innerHTML = okHtml('Sync finished.') + pretty(d);
+      }).catch(function (err) {
+        out.innerHTML = errorHtml(err.message);
+      });
+    };
+    document.getElementById('runmsg').onclick = function () {
+      var out = document.getElementById('msgout');
+      out.innerHTML = '<p class="muted">Running...</p>';
+      api.post('/api/admin/sync-messages-now', {}).then(function (d) {
+        out.innerHTML = okHtml('Message sync finished.') + pretty(d);
       }).catch(function (err) {
         out.innerHTML = errorHtml(err.message);
       });

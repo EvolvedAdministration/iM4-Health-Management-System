@@ -880,6 +880,29 @@ async function trackStage(db, implId, newStage) {
   await db.query('INSERT INTO stage_history (implementation_id, stage) VALUES ($1, $2)', [implId, newStage]);
 }
 
+// Pulls an issue's comments into the app and prunes app copies of comments
+// deleted on GitHub. Only incoming messages are reconciled; app-originated
+// messages are the system of record. Returns { pulled, pruned }. Throws on failure.
+async function syncIssueComments(db, implId, repo, issueNumber) {
+  const comments = await fetchIssueComments(repo, issueNumber);
+  const seenIds = [];
+  let pulled = 0;
+  for (const c of comments) {
+    seenIds.push(c.id);
+    const login = (c.user && c.user.login) ? c.user.login : 'github';
+    await db.query(
+      'INSERT INTO messages (implementation_id, github_comment_id, author_name, author_login, body, direction, github_created_at) ' +
+      'VALUES ($1, $2, $3, $4, $5, ' + "'in'" + ', $6) ON CONFLICT (github_comment_id) DO NOTHING',
+      [implId, c.id, login, login, c.body || '', c.created_at]);
+    pulled++;
+  }
+  const gone = await db.query(
+    "DELETE FROM messages WHERE implementation_id = $1 AND direction = 'in' AND github_comment_id IS NOT NULL " +
+    'AND NOT (github_comment_id = ANY($2::bigint[]))',
+    [implId, seenIds]);
+  return { pulled: pulled, pruned: gone.rowCount };
+}
+
 async function runGithubSync() {
   if (!GITHUB_TOKEN) throw new Error('GITHUB_TOKEN is not set');
   try {
@@ -924,24 +947,9 @@ async function runGithubSync() {
       synced++;
       if (issueNumber && repo) {
         try {
-          const comments = await fetchIssueComments(repo, issueNumber);
-          const seenIds = [];
-          for (const c of comments) {
-            seenIds.push(c.id);
-            const login = (c.user && c.user.login) ? c.user.login : 'github';
-            await db.query(
-              'INSERT INTO messages (implementation_id, github_comment_id, author_name, author_login, body, direction, github_created_at) ' +
-              'VALUES ($1, $2, $3, $4, $5, ' + "'in'" + ', $6) ON CONFLICT (github_comment_id) DO NOTHING',
-              [up.rows[0].id, c.id, login, login, c.body || '', c.created_at]);
-            commentsPulled++;
-          }
-          // Reconcile deletions: drop the app's copies of GitHub comments that no longer exist there.
-          // Only incoming messages are reconciled; app-originated messages are the system of record.
-          const gone = await db.query(
-            "DELETE FROM messages WHERE implementation_id = $1 AND direction = 'in' AND github_comment_id IS NOT NULL " +
-            'AND NOT (github_comment_id = ANY($2::bigint[]))',
-            [up.rows[0].id, seenIds]);
-          commentsPruned += gone.rowCount;
+          const r = await syncIssueComments(db, up.rows[0].id, repo, issueNumber);
+          commentsPulled += r.pulled;
+          commentsPruned += r.pruned;
         } catch (ce) {
           console.error('Comment pull failed for issue ' + issueNumber + ':', ce.message);
         }
@@ -974,6 +982,38 @@ app.post('/api/admin/sync-now', requireAdmin, async (req, res) => {
   try {
     res.json(await runGithubSync());
   } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Messages-only sync: pulls GitHub comments for every linked implementation and
+// prunes app copies of deleted comments. Lighter than the full board sync.
+async function runMessageSync() {
+  if (!GITHUB_TOKEN) throw new Error('GITHUB_TOKEN is not set');
+  const db = getPool();
+  const impls = await db.query(
+    "SELECT id, github_repo, github_issue_number FROM implementations " +
+    "WHERE github_repo IS NOT NULL AND github_issue_number IS NOT NULL ORDER BY id");
+  let pulled = 0;
+  let pruned = 0;
+  const errors = [];
+  for (const impl of impls.rows) {
+    try {
+      const r = await syncIssueComments(db, impl.id, impl.github_repo, impl.github_issue_number);
+      pulled += r.pulled;
+      pruned += r.pruned;
+    } catch (e) {
+      errors.push('impl ' + impl.id + ': ' + e.message);
+    }
+  }
+  return { success: true, implementations: impls.rows.length, comments_pulled: pulled, comments_pruned: pruned, errors: errors };
+}
+
+app.post('/api/admin/sync-messages-now', requireAdmin, async (req, res) => {
+  try {
+    res.json(await runMessageSync());
+  } catch (error) {
+    console.error('Message sync error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
