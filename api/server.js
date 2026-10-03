@@ -566,7 +566,7 @@ app.post('/api/implementations/:id/messages', requireAuth, async (req, res) => {
     }
     const stewardName = displayName(req.user);
     const nl = String.fromCharCode(10);
-    const ghBody = '**' + stewardName + '** (via ' + GITHUB_POST_AS + ')' + nl + nl + String(body).trim();
+    const ghBody = '**' + stewardName + '**' + nl + nl + String(body).trim();
     let ghComment = null;
     if (GITHUB_TOKEN && impl.github_repo && impl.github_issue_number) {
       ghComment = await postIssueComment(impl.github_repo, impl.github_issue_number, ghBody);
