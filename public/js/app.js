@@ -77,12 +77,8 @@ var state = { user: null };
 // ---------------------------------------------------------------- header (same on every page)
 function logoHtml(size) {
   size = size || 34;
-  return '<svg width="' + size + '" height="' + size + '" viewBox="0 0 48 48" aria-hidden="true">' +
-    '<rect x="2" y="2" width="44" height="44" rx="10" fill="#0099FF"/>' +
-    '<text x="24" y="30" text-anchor="middle" font-family="Arial, sans-serif" font-weight="bold" font-size="19" fill="#ffffff">iM4</text>' +
-    '<rect x="10" y="35" width="28" height="4" rx="2" fill="#FF3366"/>' +
-    '<rect x="10" y="35" width="11" height="4" rx="2" fill="#FFCC66"/>' +
-    '</svg>';
+  var w = Math.round(size * 2.25);
+  return '<img src="logo.webp" class="brand-logo" width="' + w + '" height="' + size + '" alt="iM4">';
 }
 
 function navLinks() {
@@ -613,7 +609,7 @@ function parseCSV(text) {
 }
 
 var IMPORT_FORMATS = {
-  stewards: 'steward_id, email, first_name, last_name, phone (everyone imported here is a steward)',
+  stewards: 'steward_id, email, first_name, last_name, phone, password (8+ chars; blank keeps the existing password; everyone imported here is a steward)',
   companies: 'company_code, company_name, ee_company_code, ee_company_name, payroll_total, payroll_ineligible, payroll_opted_out, payroll_qualified, payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date (YYYY-MM-DD)',
   assignments: 'steward_id, company_code'
 };

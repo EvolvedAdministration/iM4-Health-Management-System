@@ -636,7 +636,7 @@ app.get('/api/admin/assignments', requireAdmin, async (req, res) => {
 });
 
 // ---------------------------------------------------------------- admin: import (the ONLY way to update these tables)
-// stewards:    steward_id, email, first_name, last_name, phone (everyone imported is a steward)
+// stewards:    steward_id, email, first_name, last_name, phone, password (everyone imported is a steward)
 // companies:   company_code, company_name, ee_company_code, ee_company_name,
 //              payroll_total, payroll_ineligible, payroll_opted_out, payroll_qualified,
 //              payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date
@@ -661,7 +661,12 @@ function validateImport(type, rows) {
         if (seen[idKey]) { e('duplicate steward_id in file'); return; }
         seen[idKey] = true;
       }
-      valid.push({ steward_id: stewardId, email: key, first_name: row.first_name || null, last_name: row.last_name || null, phone: row.phone || null });
+      let password = null;
+      if (row.password !== undefined && row.password !== null && String(row.password) !== '') {
+        password = String(row.password);
+        if (password.length < 8) { e('password must be at least 8 characters'); return; }
+      }
+      valid.push({ steward_id: stewardId, email: key, first_name: row.first_name || null, last_name: row.last_name || null, phone: row.phone || null, password: password });
     } else if (type === 'companies') {
       if (!row.company_code) { e('company_code is required'); return; }
       if (!row.company_name) { e('company_name is required'); return; }
@@ -712,20 +717,38 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
     if (type === 'stewards') {
       for (const s of v.valid) {
         try {
+          // A password in the file is hashed and set; a blank leaves the existing one alone.
+          const hash = s.password ? await bcrypt.hash(s.password, 10) : null;
           if (s.steward_id !== null) {
             // Explicit Steward ID: upsert on id, never touch role.
-            await db.query(
-              'INSERT INTO stewards (id, email, first_name, last_name, phone, role) VALUES ($1, $2, $3, $4, $5, ' + "'steward'" + ') ' +
-              'ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, first_name = EXCLUDED.first_name, ' +
-              'last_name = EXCLUDED.last_name, phone = EXCLUDED.phone',
-              [s.steward_id, s.email, s.first_name, s.last_name, s.phone]);
+            if (hash) {
+              await db.query(
+                'INSERT INTO stewards (id, email, first_name, last_name, phone, password_hash, role) VALUES ($1, $2, $3, $4, $5, $6, ' + "'steward'" + ') ' +
+                'ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, first_name = EXCLUDED.first_name, ' +
+                'last_name = EXCLUDED.last_name, phone = EXCLUDED.phone, password_hash = EXCLUDED.password_hash',
+                [s.steward_id, s.email, s.first_name, s.last_name, s.phone, hash]);
+            } else {
+              await db.query(
+                'INSERT INTO stewards (id, email, first_name, last_name, phone, role) VALUES ($1, $2, $3, $4, $5, ' + "'steward'" + ') ' +
+                'ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, first_name = EXCLUDED.first_name, ' +
+                'last_name = EXCLUDED.last_name, phone = EXCLUDED.phone',
+                [s.steward_id, s.email, s.first_name, s.last_name, s.phone]);
+            }
           } else {
             // No Steward ID: upsert on email, never touch role.
-            await db.query(
-              'INSERT INTO stewards (email, first_name, last_name, phone, role) VALUES ($1, $2, $3, $4, ' + "'steward'" + ') ' +
-              'ON CONFLICT (email) DO UPDATE SET first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name, ' +
-              'phone = EXCLUDED.phone',
-              [s.email, s.first_name, s.last_name, s.phone]);
+            if (hash) {
+              await db.query(
+                'INSERT INTO stewards (email, first_name, last_name, phone, password_hash, role) VALUES ($1, $2, $3, $4, $5, ' + "'steward'" + ') ' +
+                'ON CONFLICT (email) DO UPDATE SET first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name, ' +
+                'phone = EXCLUDED.phone, password_hash = EXCLUDED.password_hash',
+                [s.email, s.first_name, s.last_name, s.phone, hash]);
+            } else {
+              await db.query(
+                'INSERT INTO stewards (email, first_name, last_name, phone, role) VALUES ($1, $2, $3, $4, ' + "'steward'" + ') ' +
+                'ON CONFLICT (email) DO UPDATE SET first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name, ' +
+                'phone = EXCLUDED.phone',
+                [s.email, s.first_name, s.last_name, s.phone]);
+            }
           }
           imported++;
         } catch (err) { commitErrors.push(s.email + ': ' + err.message); }
