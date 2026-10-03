@@ -1019,6 +1019,87 @@ app.post('/api/admin/sync-messages-now', requireAdmin, async (req, res) => {
   }
 });
 
+// ---------------------------------------------------------------- admin: delete data (Jobs page)
+// Imports never delete; these do. Everything runs in a transaction.
+app.post('/api/admin/delete-data', requireAdmin, async (req, res) => {
+  const db = getPool();
+  const target = req.body && req.body.target;
+  const mode = req.body && req.body.mode;
+  const key = (req.body && req.body.key) ? String(req.body.key).trim() : '';
+  const key2 = (req.body && req.body.key2) ? String(req.body.key2).trim() : '';
+  try {
+    await db.query('BEGIN');
+    let deleted = 0;
+    let detail = '';
+    if (target === 'stewards' && mode === 'all') {
+      // Admins are kept: deleting your own admin row would lock you out.
+      await db.query("UPDATE messages SET steward_id = NULL WHERE steward_id IN (SELECT id FROM stewards WHERE role <> 'admin')");
+      await db.query("DELETE FROM assignments WHERE steward_id IN (SELECT id FROM stewards WHERE role <> 'admin')");
+      const r = await db.query("DELETE FROM stewards WHERE role <> 'admin'");
+      deleted = r.rowCount;
+      detail = 'non-admin stewards and their assignments removed (admins kept)';
+    } else if (target === 'stewards' && mode === 'one') {
+      if (!key) throw new Error('Enter a Steward ID or email');
+      const byEmail = key.indexOf('@') !== -1;
+      const s = byEmail
+        ? await db.query('SELECT id, role FROM stewards WHERE LOWER(email) = LOWER($1)', [key])
+        : await db.query('SELECT id, role FROM stewards WHERE id = $1', [parseInt(key, 10)]);
+      if (s.rows.length === 0) throw new Error('Steward not found: ' + key);
+      if (s.rows[0].role === 'admin') throw new Error('Refusing to delete an admin account');
+      const sid = s.rows[0].id;
+      await db.query('UPDATE messages SET steward_id = NULL WHERE steward_id = $1', [sid]);
+      await db.query('DELETE FROM assignments WHERE steward_id = $1', [sid]);
+      await db.query('DELETE FROM stewards WHERE id = $1', [sid]);
+      deleted = 1;
+      detail = 'steward ' + key + ' and their assignments removed';
+    } else if (target === 'companies' && mode === 'all') {
+      const c = await db.query('SELECT COUNT(*)::int AS n FROM companies');
+      await db.query('TRUNCATE companies RESTART IDENTITY CASCADE');
+      deleted = c.rows[0].n;
+      detail = 'companies removed with their implementations, messages, summaries and assignments';
+    } else if (target === 'companies' && mode === 'one') {
+      if (!key) throw new Error('Enter a Company Code');
+      const c = await db.query('SELECT id FROM companies WHERE company_code = $1', [key]);
+      if (c.rows.length === 0) throw new Error('Company not found: ' + key);
+      const cid = c.rows[0].id;
+      const impls = await db.query('SELECT id FROM implementations WHERE company_id = $1', [cid]);
+      const ids = impls.rows.map(function (r) { return r.id; });
+      if (ids.length > 0) {
+        await db.query('DELETE FROM messages WHERE implementation_id = ANY($1)', [ids]);
+        await db.query('DELETE FROM implementation_summaries WHERE implementation_id = ANY($1)', [ids]);
+        await db.query('DELETE FROM stage_history WHERE implementation_id = ANY($1)', [ids]);
+        await db.query('DELETE FROM implementations WHERE id = ANY($1)', [ids]);
+      }
+      await db.query('DELETE FROM assignments WHERE company_id = $1', [cid]);
+      await db.query('DELETE FROM companies WHERE id = $1', [cid]);
+      deleted = 1;
+      detail = 'company ' + key + ' removed with its implementations, messages, summaries and assignments';
+    } else if (target === 'assignments' && mode === 'all') {
+      const a = await db.query('SELECT COUNT(*)::int AS n FROM assignments');
+      await db.query('TRUNCATE assignments RESTART IDENTITY');
+      deleted = a.rows[0].n;
+      detail = 'assignments removed';
+    } else if (target === 'assignments' && mode === 'one') {
+      if (!key || !key2) throw new Error('Enter a Steward ID and a Company Code');
+      const sid = parseInt(key, 10);
+      if (isNaN(sid)) throw new Error('Steward ID must be a number');
+      const r = await db.query(
+        'DELETE FROM assignments WHERE steward_id = $1 AND company_id = (SELECT id FROM companies WHERE company_code = $2)',
+        [sid, key2]);
+      if (r.rowCount === 0) throw new Error('Assignment not found for steward ' + key + ' and company ' + key2);
+      deleted = r.rowCount;
+      detail = 'assignment of steward ' + key + ' to company ' + key2 + ' removed';
+    } else {
+      throw new Error('Unknown delete request');
+    }
+    await db.query('COMMIT');
+    res.json({ success: true, deleted: deleted, detail: detail });
+  } catch (error) {
+    await db.query('ROLLBACK');
+    res.status(400).json({ success: false, error: error.message });
+  }
+});
+
 // ---------------------------------------------------------------- claude summaries (Sun-Thu nights + on demand)
 // Learns stage durations from real cases (stage_history); falls back to defaults.
 async function typicalDurations(db) {

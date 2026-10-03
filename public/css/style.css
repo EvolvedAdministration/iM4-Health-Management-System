@@ -128,6 +128,8 @@ a:hover { text-decoration: underline; }
 
 .btn-primary { background: var(--primary); border-color: var(--primary); color: #fff; font-weight: 600; }
 .btn-primary:hover { background: var(--primary-dark); }
+.btn-danger { background: var(--secondary); border-color: var(--secondary); color: #fff; font-weight: 600; }
+.btn-danger:hover { filter: brightness(0.9); }
 .btn-small { padding: 3px 8px; }
 .btn-link { background: none; border: none; color: #fff; cursor: pointer; padding: 4px 6px; }
 .btn-link:hover { text-decoration: underline; }

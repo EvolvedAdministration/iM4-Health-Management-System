@@ -682,7 +682,33 @@ function viewAdminJobs() {
       '<div class="card"><div class="card-title">Claude project summaries</div>' +
       '<p class="muted">Generates fresh summaries for every active implementation.</p>' +
       '<button class="btn btn-primary" id="runsum">Run summaries now</button><div id="sumout"></div></div>' +
-      '</div>',
+      '</div>' +
+      '<h3>Delete data</h3>' +
+      '<p class="muted">Imports never delete. Use these to wipe a table or remove one record by its key. Deletions cannot be undone.</p>' +
+      '<div class="card-grid">' +
+      '<div class="card"><div class="card-title">Delete all stewards</div>' +
+      '<p class="muted">Removes every non-admin steward and their assignments. Admins are kept.</p>' +
+      '<button class="btn btn-danger" id="delstewards">Delete all stewards</button></div>' +
+      '<div class="card"><div class="card-title">Delete one steward</div>' +
+      '<p class="muted">By Steward ID or email. Admins cannot be deleted.</p>' +
+      '<input id="delstewardkey" placeholder="Steward ID or email">' +
+      '<button class="btn btn-danger" id="delstewardone">Delete steward</button></div>' +
+      '<div class="card"><div class="card-title">Delete all companies</div>' +
+      '<p class="muted">Removes every company plus their implementations, messages, summaries and assignments.</p>' +
+      '<button class="btn btn-danger" id="delcompanies">Delete all companies</button></div>' +
+      '<div class="card"><div class="card-title">Delete one company</div>' +
+      '<p class="muted">By Company Code, with its implementations, messages, summaries and assignments.</p>' +
+      '<input id="delcompanykey" placeholder="Company Code">' +
+      '<button class="btn btn-danger" id="delcompanyone">Delete company</button></div>' +
+      '<div class="card"><div class="card-title">Delete all assignments</div>' +
+      '<p class="muted">Removes every steward to company link.</p>' +
+      '<button class="btn btn-danger" id="delassignments">Delete all assignments</button></div>' +
+      '<div class="card"><div class="card-title">Delete one assignment</div>' +
+      '<p class="muted">By Steward ID and Company Code.</p>' +
+      '<input id="delassignkey1" placeholder="Steward ID">' +
+      '<input id="delassignkey2" placeholder="Company Code">' +
+      '<button class="btn btn-danger" id="delassignone">Delete assignment</button></div>' +
+      '</div><div id="delout"></div>',
       'jobs'));
     function pretty(d) {
       return '<pre class="muted">' + esc(JSON.stringify(d, null, 1)) + '</pre>';
@@ -713,6 +739,41 @@ function viewAdminJobs() {
       }).catch(function (err) {
         out.innerHTML = errorHtml(err.message);
       });
+    };
+    function del(target, mode, key, key2, confirmText) {
+      var out = document.getElementById('delout');
+      if (!window.confirm(confirmText)) return;
+      out.innerHTML = '<p class="muted">Deleting...</p>';
+      api.post('/api/admin/delete-data', { target: target, mode: mode, key: key, key2: key2 }).then(function (d) {
+        out.innerHTML = okHtml('Deleted ' + d.deleted + ' — ' + d.detail + '.');
+      }).catch(function (err) {
+        out.innerHTML = errorHtml(err.message);
+      });
+    }
+    document.getElementById('delstewards').onclick = function () {
+      del('stewards', 'all', '', '', 'Delete ALL non-admin stewards and their assignments? This cannot be undone.');
+    };
+    document.getElementById('delstewardone').onclick = function () {
+      var k = document.getElementById('delstewardkey').value.trim();
+      if (!k) { document.getElementById('delout').innerHTML = errorHtml('Enter a Steward ID or email.'); return; }
+      del('stewards', 'one', k, '', 'Delete steward "' + k + '" and their assignments? This cannot be undone.');
+    };
+    document.getElementById('delcompanies').onclick = function () {
+      del('companies', 'all', '', '', 'Delete ALL companies, implementations, messages and summaries? This cannot be undone.');
+    };
+    document.getElementById('delcompanyone').onclick = function () {
+      var k = document.getElementById('delcompanykey').value.trim();
+      if (!k) { document.getElementById('delout').innerHTML = errorHtml('Enter a Company Code.'); return; }
+      del('companies', 'one', k, '', 'Delete company "' + k + '" with its implementations, messages and summaries? This cannot be undone.');
+    };
+    document.getElementById('delassignments').onclick = function () {
+      del('assignments', 'all', '', '', 'Delete ALL steward to company assignments? This cannot be undone.');
+    };
+    document.getElementById('delassignone').onclick = function () {
+      var k1 = document.getElementById('delassignkey1').value.trim();
+      var k2 = document.getElementById('delassignkey2').value.trim();
+      if (!k1 || !k2) { document.getElementById('delout').innerHTML = errorHtml('Enter a Steward ID and a Company Code.'); return; }
+      del('assignments', 'one', k1, k2, 'Delete the assignment of steward ' + k1 + ' to company ' + k2 + '? This cannot be undone.');
     };
   });
 }
