@@ -674,7 +674,7 @@ function viewAdminJobs() {
       '<p class="muted">Run the scheduled jobs on demand. The GitHub sync also runs every 6 hours; summaries run Sunday through Thursday at 9:00 PM.</p>' +
       '<div class="card-grid">' +
       '<div class="card"><div class="card-title">GitHub kanban sync</div>' +
-      '<p class="muted">Pulls board cards, links implementations, pulls comments.</p>' +
+      '<p class="muted">Pulls board cards, links implementations, pulls comments, removes app copies of comments deleted on GitHub.</p>' +
       '<button class="btn btn-primary" id="runsync">Run sync now</button><div id="syncout"></div></div>' +
       '<div class="card"><div class="card-title">Claude project summaries</div>' +
       '<p class="muted">Generates fresh summaries for every active implementation.</p>' +

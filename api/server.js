@@ -890,6 +890,7 @@ async function runGithubSync() {
     let skippedNoCode = 0;
     let skippedNotOnList = 0;
     let commentsPulled = 0;
+    let commentsPruned = 0;
     const syncedIds = [];
     for (const item of items) {
       const fields = {};
@@ -924,7 +925,9 @@ async function runGithubSync() {
       if (issueNumber && repo) {
         try {
           const comments = await fetchIssueComments(repo, issueNumber);
+          const seenIds = [];
           for (const c of comments) {
+            seenIds.push(c.id);
             const login = (c.user && c.user.login) ? c.user.login : 'github';
             await db.query(
               'INSERT INTO messages (implementation_id, github_comment_id, author_name, author_login, body, direction, github_created_at) ' +
@@ -932,6 +935,13 @@ async function runGithubSync() {
               [up.rows[0].id, c.id, login, login, c.body || '', c.created_at]);
             commentsPulled++;
           }
+          // Reconcile deletions: drop the app's copies of GitHub comments that no longer exist there.
+          // Only incoming messages are reconciled; app-originated messages are the system of record.
+          const gone = await db.query(
+            "DELETE FROM messages WHERE implementation_id = $1 AND direction = 'in' AND github_comment_id IS NOT NULL " +
+            'AND NOT (github_comment_id = ANY($2::bigint[]))',
+            [up.rows[0].id, seenIds]);
+          commentsPruned += gone.rowCount;
         } catch (ce) {
           console.error('Comment pull failed for issue ' + issueNumber + ':', ce.message);
         }
@@ -943,7 +953,7 @@ async function runGithubSync() {
       await db.query('DELETE FROM implementations WHERE github_item_id IS NOT NULL');
     }
     const compCount = await db.query('SELECT COUNT(*)::int AS c FROM companies');
-    return { success: true, synced: synced, skipped_hold_dead: skippedHoldDead, skipped_no_code: skippedNoCode, skipped_not_on_list: skippedNotOnList, companies: compCount.rows[0].c, comments_pulled: commentsPulled };
+    return { success: true, synced: synced, skipped_hold_dead: skippedHoldDead, skipped_no_code: skippedNoCode, skipped_not_on_list: skippedNotOnList, companies: compCount.rows[0].c, comments_pulled: commentsPulled, comments_pruned: commentsPruned };
   } catch (error) {
     console.error('GitHub sync error:', error);
     throw error;
