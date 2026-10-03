@@ -77,8 +77,8 @@ var state = { user: null };
 // ---------------------------------------------------------------- header (same on every page)
 function logoHtml(size) {
   size = size || 34;
-  var w = Math.round(size * 2.25);
-  return '<img src="logo.webp" class="brand-logo" width="' + w + '" height="' + size + '" alt="iM4">';
+  var w = Math.round(size * 1.31);
+  return '<img src="logo.webp" class="brand-logo" width="' + w + '" height="' + size + '" alt="iM4 Health">';
 }
 
 function navLinks() {
