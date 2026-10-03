@@ -330,8 +330,10 @@ function viewChild(id) {
       var c = d.company;
       var implCards = d.implementations.map(implCard).join('');
       var stewardList = d.stewards.map(function (s) { return esc(personName(s)); }).join(', ');
-      var parentLink = (c.parent_company_code && c.parent_company_code !== c.company_code)
-        ? '<p><a href="#/parent/' + esc(c.parent_company_code) + '">&larr; ' + esc(c.parent_company_name || c.parent_company_code) + '</a></p>'
+      var eeCode = c.ee_company_code || c.parent_company_code;
+      var eeName = c.ee_company_name || c.parent_company_name || eeCode;
+      var parentLink = (eeCode && eeCode !== c.company_code)
+        ? '<p><a href="#/parent/' + esc(eeCode) + '">&larr; ' + esc(eeName) + '</a></p>'
         : '<p><a href="#/clients">&larr; Clients</a></p>';
       render(shell(parentLink +
         '<h2><span class="code-chip">' + esc(c.company_code) + '</span> ' + esc(c.company_name) + '</h2>' +
@@ -469,7 +471,7 @@ function viewProject(id) {
       render(shell(
         '<p><a href="#/implementations">&larr; Implementations</a></p>' +
         '<h2><span class="code-chip">' + esc(i.company_code) + '</span> ' + esc(i.company_name) + '</h2>' +
-        (i.parent_company_code ? '<p class="muted">' + esc(i.parent_company_name || i.parent_company_code) + '</p>' : '') +
+        ((i.ee_company_name || i.parent_company_name) ? '<p class="muted">' + esc(i.ee_company_name || i.parent_company_name) + '</p>' : '') +
         '<div class="proj-grid"><div>' +
         '<h3>Project lifecycle</h3>' + lifecycleVisual(i.stage, i.days_in_stage) +
         '<p>' + statusBadge(i.status) + '</p>' +
@@ -541,11 +543,13 @@ function viewAdminCompanies() {
     if (state.user.role !== 'admin') { location.hash = '#/clients'; return; }
     api.get('/api/admin/companies').then(function (list) {
       function cell(v) { return '<td>' + (v === null || v === undefined || v === '' ? '&mdash;' : esc(v)) + '</td>'; }
+      function eeCode(c) { return c.ee_company_code || c.parent_company_code; }
+      function eeName(c) { return c.ee_company_name || c.parent_company_name; }
       var rows = list.map(function (c) {
         var elig = (c.payroll_qualified !== null && c.payroll_qualified !== undefined) ? c.payroll_qualified
           : (c.payroll_total !== null && c.payroll_total !== undefined ? (c.payroll_total || 0) - (c.payroll_ineligible || 0) - (c.payroll_opted_out || 0) : null);
         return '<tr><td><b>' + esc(c.company_code) + '</b></td><td>' + esc(c.company_name) + '</td>' +
-          cell(c.parent_company_code) + cell(c.parent_company_name) +
+          cell(eeCode(c)) + cell(eeName(c)) +
           cell(c.payroll_total) + cell(c.payroll_ineligible) + cell(c.payroll_opted_out) +
           cell(elig) + cell(c.payroll_new_qualified) + cell(c.payroll_enrolled) + cell(c.payroll_not_enrolled) + '</tr>';
       }).join('');
@@ -553,7 +557,7 @@ function viewAdminCompanies() {
         '<h2>Companies</h2>' +
         '<p class="muted">Companies are updated by CSV import only (<a href="#/admin/import">Import tab</a>).</p>' +
         '<div class="table-scroll"><table class="data-table"><thead>' +
-        '<tr><th>Company Code</th><th>Company Name</th><th>Parent Code</th><th>Parent Name</th>' +
+        '<tr><th>Company Code</th><th>Company Name</th><th>EE Code</th><th>EE Name</th>' +
         '<th colspan="7">Last Payroll</th></tr><tr><th></th><th></th><th></th><th></th>' +
         '<th>Total Employees</th><th>Ineligible</th><th>Opt Out</th><th>Eligible</th><th>New Qualified</th><th>Enrolled</th><th>Not Enrolled</th></tr></thead>' +
         '<tbody>' + rows + '</tbody></table></div>',
@@ -609,9 +613,9 @@ function parseCSV(text) {
 }
 
 var IMPORT_FORMATS = {
-  stewards: 'email, first_name, last_name, phone, role (steward or admin)',
-  companies: 'company_code, company_name, parent_company_code, parent_company_name, payroll_total, payroll_ineligible, payroll_opted_out, payroll_qualified, payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date (YYYY-MM-DD)',
-  assignments: 'steward_id (or steward_email), company_code'
+  stewards: 'steward_id, email, first_name, last_name, phone (everyone imported here is a steward)',
+  companies: 'company_code, company_name, ee_company_code, ee_company_name, payroll_total, payroll_ineligible, payroll_opted_out, payroll_qualified, payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date (YYYY-MM-DD)',
+  assignments: 'steward_id, company_code'
 };
 
 function viewAdminImport() {

@@ -122,6 +122,8 @@ async function migrate() {
     ['companies', 'github_issue_number', 'INT'],
     ['companies', 'parent_company_code', 'TEXT'],
     ['companies', 'parent_company_name', 'TEXT'],
+    ['companies', 'ee_company_code', 'TEXT'],
+    ['companies', 'ee_company_name', 'TEXT'],
     ['companies', 'payroll_total', 'INT'],
     ['companies', 'payroll_ineligible', 'INT'],
     ['companies', 'payroll_opted_out', 'INT'],
@@ -143,6 +145,9 @@ async function migrate() {
   for (const [table, col, def] of cols) {
     await db.query('ALTER TABLE ' + table + ' ADD COLUMN IF NOT EXISTS ' + col + ' ' + def);
   }
+  // v5: "parent" renamed to "ee" on import headings; carry existing values over.
+  await db.query('UPDATE companies SET ee_company_code = parent_company_code WHERE (ee_company_code IS NULL OR ee_company_code = ' + "''" + ') AND parent_company_code IS NOT NULL AND parent_company_code <> ' + "''");
+  await db.query('UPDATE companies SET ee_company_name = parent_company_name WHERE (ee_company_name IS NULL OR ee_company_name = ' + "''" + ') AND parent_company_name IS NOT NULL AND parent_company_name <> ' + "''");
   await db.query("UPDATE stewards SET role = 'steward' WHERE role IS NULL OR role = ''");
   await db.query("UPDATE stewards SET first_name = SPLIT_PART(name, ' ', 1) " +
     "WHERE (first_name IS NULL OR first_name = '') AND name IS NOT NULL AND name <> ''");
@@ -225,10 +230,14 @@ function eligibleOf(c) {
 }
 
 function parentKey(c) {
-  return (c.parent_company_code && String(c.parent_company_code).trim()) || c.company_code;
+  const ee = c.ee_company_code && String(c.ee_company_code).trim();
+  const par = c.parent_company_code && String(c.parent_company_code).trim();
+  return ee || par || c.company_code;
 }
 function parentName(c) {
-  return (c.parent_company_name && String(c.parent_company_name).trim()) || c.company_name;
+  const ee = c.ee_company_name && String(c.ee_company_name).trim();
+  const par = c.parent_company_name && String(c.parent_company_name).trim();
+  return ee || par || c.company_name;
 }
 
 // ---------------------------------------------------------------- public
@@ -411,6 +420,8 @@ app.get('/api/clients', requireAuth, async (req, res) => {
       params.push('%' + q + '%');
       where += (where ? ' AND ' : 'WHERE ') + '(LOWER(c.company_code) LIKE $' + params.length +
         ' OR LOWER(c.company_name) LIKE $' + params.length +
+        ' OR LOWER(COALESCE(c.ee_company_code, ' + "''" + ')) LIKE $' + params.length +
+        ' OR LOWER(COALESCE(c.ee_company_name, ' + "''" + ')) LIKE $' + params.length +
         ' OR LOWER(COALESCE(c.parent_company_code, ' + "''" + ')) LIKE $' + params.length +
         ' OR LOWER(COALESCE(c.parent_company_name, ' + "''" + ')) LIKE $' + params.length + ')';
     }
@@ -427,7 +438,7 @@ app.get('/api/parents/:code', requireAuth, async (req, res) => {
   try {
     const code = String(req.params.code);
     const ids = await visibleCompanyIds(req.user);
-    let where = "(c.company_code = $1 OR c.parent_company_code = $1)";
+    let where = "(c.company_code = $1 OR c.ee_company_code = $1 OR c.parent_company_code = $1)";
     const params = [code];
     if (ids) {
       if (ids.length === 0) return res.status(403).json({ error: 'Not assigned to this client' });
@@ -518,7 +529,7 @@ app.get('/api/implementations/:id', requireAuth, async (req, res) => {
   try {
     const ids = await visibleCompanyIds(req.user);
     const r = await getPool().query(
-      'SELECT i.*, c.company_code, c.company_name, c.parent_company_code, c.parent_company_name, ' +
+      'SELECT i.*, c.company_code, c.company_name, c.ee_company_code, c.ee_company_name, c.parent_company_code, c.parent_company_name, ' +
       'EXTRACT(DAY FROM (NOW() - i.updated_at))::int AS days_in_stage, ' +
       '(SELECT entered_at FROM stage_history h WHERE h.implementation_id = i.id AND h.exited_at IS NULL ' +
       'ORDER BY h.entered_at DESC LIMIT 1) AS stage_entered_at ' +
@@ -625,11 +636,11 @@ app.get('/api/admin/assignments', requireAdmin, async (req, res) => {
 });
 
 // ---------------------------------------------------------------- admin: import (the ONLY way to update these tables)
-// stewards:    email, first_name, last_name, phone, role (admin|steward)
-// companies:   company_code, company_name, parent_company_code, parent_company_name,
+// stewards:    steward_id, email, first_name, last_name, phone (everyone imported is a steward)
+// companies:   company_code, company_name, ee_company_code, ee_company_name,
 //              payroll_total, payroll_ineligible, payroll_opted_out, payroll_qualified,
 //              payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date
-// assignments: steward_id (or steward_email), company_code
+// assignments: steward_id, company_code
 function validateImport(type, rows) {
   const errors = [];
   const valid = [];
@@ -642,18 +653,27 @@ function validateImport(type, rows) {
       const key = String(row.email).trim().toLowerCase();
       if (seen[key]) { e('duplicate email in file'); return; }
       seen[key] = true;
-      const role = String(row.role || 'steward').trim().toLowerCase() === 'admin' ? 'admin' : 'steward';
-      valid.push({ email: key, first_name: row.first_name || null, last_name: row.last_name || null, phone: row.phone || null, role: role });
+      let stewardId = null;
+      if (row.steward_id !== undefined && row.steward_id !== null && String(row.steward_id).trim() !== '') {
+        stewardId = parseInt(String(row.steward_id).trim(), 10);
+        if (isNaN(stewardId) || stewardId <= 0) { e('steward_id must be a positive number'); return; }
+        const idKey = 'id:' + stewardId;
+        if (seen[idKey]) { e('duplicate steward_id in file'); return; }
+        seen[idKey] = true;
+      }
+      valid.push({ steward_id: stewardId, email: key, first_name: row.first_name || null, last_name: row.last_name || null, phone: row.phone || null });
     } else if (type === 'companies') {
       if (!row.company_code) { e('company_code is required'); return; }
       if (!row.company_name) { e('company_name is required'); return; }
       const key = String(row.company_code).trim();
       if (seen[key]) { e('duplicate company_code in file'); return; }
       seen[key] = true;
+      const eeCode = row.ee_company_code || row.parent_company_code;
+      const eeName = row.ee_company_name || row.parent_company_name;
       valid.push({
         company_code: key, company_name: String(row.company_name).trim(),
-        parent_company_code: row.parent_company_code ? String(row.parent_company_code).trim() : null,
-        parent_company_name: row.parent_company_name ? String(row.parent_company_name).trim() : null,
+        ee_company_code: eeCode ? String(eeCode).trim() : null,
+        ee_company_name: eeName ? String(eeName).trim() : null,
         payroll_total: num(row.payroll_total), payroll_ineligible: num(row.payroll_ineligible),
         payroll_opted_out: num(row.payroll_opted_out), payroll_qualified: num(row.payroll_qualified),
         payroll_enrolled: num(row.payroll_enrolled), payroll_not_enrolled: num(row.payroll_not_enrolled),
@@ -661,12 +681,13 @@ function validateImport(type, rows) {
         payroll_dataset_date: row.payroll_dataset_date || null
       });
     } else if (type === 'assignments') {
-      const sid = row.steward_id || row.steward_email;
-      if (!sid || !row.company_code) { e('steward_id (or steward_email) and company_code are required'); return; }
-      const key = String(sid).trim().toLowerCase() + '|' + String(row.company_code).trim();
+      if (!row.steward_id || !row.company_code) { e('steward_id and company_code are required'); return; }
+      const sid = parseInt(String(row.steward_id).trim(), 10);
+      if (isNaN(sid) || sid <= 0) { e('steward_id must be a positive number'); return; }
+      const key = sid + '|' + String(row.company_code).trim();
       if (seen[key]) { e('duplicate assignment in file'); return; }
       seen[key] = true;
-      valid.push({ steward_ref: String(sid).trim(), company_code: String(row.company_code).trim() });
+      valid.push({ steward_id: sid, company_code: String(row.company_code).trim() });
     } else {
       e('unknown import type');
     }
@@ -691,50 +712,54 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
     if (type === 'stewards') {
       for (const s of v.valid) {
         try {
-          const selfRow = await db.query('SELECT id FROM stewards WHERE LOWER(email) = LOWER($1)', [s.email]);
-          let role = s.role;
-          if (selfRow.rows.length > 0 && String(selfRow.rows[0].id) === String(req.user.id) && role !== 'admin') {
-            role = 'admin';
+          if (s.steward_id !== null) {
+            // Explicit Steward ID: upsert on id, never touch role.
+            await db.query(
+              'INSERT INTO stewards (id, email, first_name, last_name, phone, role) VALUES ($1, $2, $3, $4, $5, ' + "'steward'" + ') ' +
+              'ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, first_name = EXCLUDED.first_name, ' +
+              'last_name = EXCLUDED.last_name, phone = EXCLUDED.phone',
+              [s.steward_id, s.email, s.first_name, s.last_name, s.phone]);
+          } else {
+            // No Steward ID: upsert on email, never touch role.
+            await db.query(
+              'INSERT INTO stewards (email, first_name, last_name, phone, role) VALUES ($1, $2, $3, $4, ' + "'steward'" + ') ' +
+              'ON CONFLICT (email) DO UPDATE SET first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name, ' +
+              'phone = EXCLUDED.phone',
+              [s.email, s.first_name, s.last_name, s.phone]);
           }
-          await db.query(
-            'INSERT INTO stewards (email, first_name, last_name, phone, role) VALUES ($1, $2, $3, $4, $5) ' +
-            'ON CONFLICT (email) DO UPDATE SET first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name, ' +
-            'phone = EXCLUDED.phone, role = EXCLUDED.role',
-            [s.email, s.first_name, s.last_name, s.phone, role]);
           imported++;
         } catch (err) { commitErrors.push(s.email + ': ' + err.message); }
       }
+      await db.query("SELECT setval('stewards_id_seq', COALESCE((SELECT MAX(id) FROM stewards), 1))");
     } else if (type === 'companies') {
       for (const c of v.valid) {
         try {
           await db.query(
-            'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, ' +
+            'INSERT INTO companies (company_code, company_name, ee_company_code, ee_company_name, ' +
             'payroll_total, payroll_ineligible, payroll_opted_out, ' +
             'payroll_qualified, payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date) ' +
             'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ' +
             'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, ' +
-            'parent_company_code = EXCLUDED.parent_company_code, parent_company_name = EXCLUDED.parent_company_name, ' +
+            'ee_company_code = EXCLUDED.ee_company_code, ee_company_name = EXCLUDED.ee_company_name, ' +
             'payroll_total = EXCLUDED.payroll_total, payroll_ineligible = EXCLUDED.payroll_ineligible, ' +
             'payroll_opted_out = EXCLUDED.payroll_opted_out, payroll_qualified = EXCLUDED.payroll_qualified, ' +
             'payroll_enrolled = EXCLUDED.payroll_enrolled, payroll_not_enrolled = EXCLUDED.payroll_not_enrolled, ' +
             'payroll_new_qualified = EXCLUDED.payroll_new_qualified, payroll_dataset_date = EXCLUDED.payroll_dataset_date',
-            [c.company_code, c.company_name, c.parent_company_code, c.parent_company_name,
+            [c.company_code, c.company_name, c.ee_company_code, c.ee_company_name,
               c.payroll_total, c.payroll_ineligible, c.payroll_opted_out,
               c.payroll_qualified, c.payroll_enrolled, c.payroll_not_enrolled, c.payroll_new_qualified, c.payroll_dataset_date]);
           imported++;
         } catch (err) { commitErrors.push(c.company_code + ': ' + err.message); }
       }
     } else {
-      const byEmail = {};
-      const byId = {};
-      (await db.query('SELECT id, LOWER(email) AS email FROM stewards')).rows.forEach(x => { byEmail[x.email] = x.id; byId[String(x.id)] = x.id; });
+      const sMap = {};
+      (await db.query('SELECT id FROM stewards')).rows.forEach(x => { sMap[String(x.id)] = x.id; });
       const cMap = {};
       (await db.query('SELECT id, company_code FROM companies')).rows.forEach(x => { cMap[x.company_code] = x.id; });
       for (const a of v.valid) {
-        const ref = a.steward_ref.toLowerCase();
-        const sid = byId[a.steward_ref] || byEmail[ref];
+        const sid = sMap[String(a.steward_id)];
         const cid = cMap[a.company_code];
-        if (!sid) { commitErrors.push(a.steward_ref + ': steward not found'); continue; }
+        if (!sid) { commitErrors.push(a.steward_id + ': steward not found'); continue; }
         if (!cid) { commitErrors.push(a.company_code + ': company not found (is it on the company list?)'); continue; }
         await db.query('INSERT INTO assignments (steward_id, company_id) VALUES ($1, $2) ON CONFLICT DO NOTHING', [sid, cid]);
         imported++;
