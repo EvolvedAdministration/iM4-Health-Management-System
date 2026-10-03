@@ -1,8 +1,7 @@
-// iM4 Health Management System (Smart Hub) - v3
-// Roles: admin + steward (mutually exclusive). Password auth (bcrypt) + JWT.
-// Stewards/Companies/Assignments are updated ONLY by admin CSV import.
-// Sync links kanban cards to companies already on the company list (by
-// 4-digit company code) — it never creates companies.
+// iM4 Health Management System (Smart Hub) - v4
+// Parent/child companies with payroll roll-ups. Stewards/Companies/Assignments
+// remain import-only. Link-only kanban sync. Stage-duration learning feeds the
+// Claude summary prompt (RAG status, key dates, to-dos with owners/due dates).
 
 const express = require('express');
 const cors = require('cors');
@@ -31,6 +30,17 @@ const EMAIL_FROM = process.env.EMAIL_FROM || 'no-reply@iam4.health';
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const APP_URL = process.env.APP_URL || '';
+
+const STAGES = ['Data Gathering', 'Initiation', 'Onboarding IHIA', 'Implementation', 'Go Live', 'Complete'];
+// Default expected working days per stage until real cases teach us better.
+const DEFAULT_STAGE_DAYS = {
+  'Data Gathering': 30,
+  'Initiation': 7,
+  'Onboarding IHIA': 7,
+  'Implementation': 30,
+  'Go Live': 14,
+  'Complete': 0
+};
 
 // ---------------------------------------------------------------- database
 let pool = null;
@@ -89,6 +99,15 @@ async function migrate() {
     'body TEXT NOT NULL, ' +
     'created_at TIMESTAMPTZ DEFAULT NOW(), ' +
     'UNIQUE(implementation_id, summary_date))');
+  // Stage-duration learning: one row per stage visit. Kept (SET NULL) even if
+  // the implementation tile is later removed, so real cases keep teaching us.
+  await db.query('CREATE TABLE IF NOT EXISTS stage_history (' +
+    'id SERIAL PRIMARY KEY, ' +
+    'implementation_id INT REFERENCES implementations(id) ON DELETE SET NULL, ' +
+    'stage TEXT NOT NULL, ' +
+    'entered_at TIMESTAMPTZ DEFAULT NOW(), ' +
+    'exited_at TIMESTAMPTZ, ' +
+    'days INT)');
 
   const cols = [
     ['stewards', 'role', "TEXT NOT NULL DEFAULT 'steward'"],
@@ -101,6 +120,8 @@ async function migrate() {
     ['stewards', 'created_at', 'TIMESTAMPTZ DEFAULT NOW()'],
     ['companies', 'created_at', 'TIMESTAMPTZ DEFAULT NOW()'],
     ['companies', 'github_issue_number', 'INT'],
+    ['companies', 'parent_company_code', 'TEXT'],
+    ['companies', 'parent_company_name', 'TEXT'],
     ['companies', 'payroll_total', 'INT'],
     ['companies', 'payroll_ineligible', 'INT'],
     ['companies', 'payroll_opted_out', 'INT'],
@@ -123,7 +144,6 @@ async function migrate() {
     await db.query('ALTER TABLE ' + table + ' ADD COLUMN IF NOT EXISTS ' + col + ' ' + def);
   }
   await db.query("UPDATE stewards SET role = 'steward' WHERE role IS NULL OR role = ''");
-  // Backfill first/last name from the old single name field where empty.
   await db.query("UPDATE stewards SET first_name = SPLIT_PART(name, ' ', 1) " +
     "WHERE (first_name IS NULL OR first_name = '') AND name IS NOT NULL AND name <> ''");
   await db.query("UPDATE stewards SET last_name = NULLIF(SUBSTRING(name FROM POSITION(' ' IN name) + 1), '') " +
@@ -195,6 +215,20 @@ function num(v) {
   if (v === undefined || v === null || v === '') return null;
   const n = parseInt(v, 10);
   return isNaN(n) ? null : n;
+}
+
+// Eligible = stored qualified value, else computed total - ineligible - opted out.
+function eligibleOf(c) {
+  if (c.payroll_qualified !== null && c.payroll_qualified !== undefined) return c.payroll_qualified;
+  if (c.payroll_total === null || c.payroll_total === undefined) return null;
+  return (c.payroll_total || 0) - (c.payroll_ineligible || 0) - (c.payroll_opted_out || 0);
+}
+
+function parentKey(c) {
+  return (c.parent_company_code && String(c.parent_company_code).trim()) || c.company_code;
+}
+function parentName(c) {
+  return (c.parent_company_name && String(c.parent_company_name).trim()) || c.company_name;
 }
 
 // ---------------------------------------------------------------- public
@@ -319,19 +353,49 @@ async function visibleCompanyIds(user) {
   return r.rows.map(x => x.company_id);
 }
 
-function numericCodeSort() {
-  return "ORDER BY CASE WHEN company_code ~ '^[0-9]+$' THEN 0 ELSE 1 END, " +
-    "CASE WHEN company_code ~ '^[0-9]+$' THEN company_code::int END NULLS LAST, company_code";
+function numericCodeSort(prefix) {
+  const p = prefix ? prefix + '.' : '';
+  return "ORDER BY CASE WHEN " + p + "company_code ~ '^[0-9]+$' THEN 0 ELSE 1 END, " +
+    "CASE WHEN " + p + "company_code ~ '^[0-9]+$' THEN " + p + "company_code::int END NULLS LAST, " + p + "company_code";
 }
 
-// Qualified = stored value, else computed as total - ineligible - opted out.
-function qualifiedOf(c) {
-  if (c.payroll_qualified !== null && c.payroll_qualified !== undefined) return c.payroll_qualified;
-  if (c.payroll_total === null || c.payroll_total === undefined) return null;
-  return (c.payroll_total || 0) - (c.payroll_ineligible || 0) - (c.payroll_opted_out || 0);
+// Build parent groups from company rows. Each group: one card on Clients.
+// Payroll is rolled up from the children: Total, Eligible, Enrolled.
+function groupParents(rows) {
+  const map = {};
+  const order = [];
+  rows.forEach(function (c) {
+    const key = parentKey(c);
+    if (!map[key]) {
+      map[key] = { code: key, name: parentName(c), children: [], total: 0, eligible: 0, enrolled: 0, has_total: false, has_eligible: false, has_enrolled: false };
+      order.push(key);
+    }
+    const g = map[key];
+    if (String(c.company_code) !== String(key)) g.name = parentName(c);
+    const child = {
+      id: c.id, company_code: c.company_code, company_name: c.company_name,
+      total: c.payroll_total, eligible: eligibleOf(c), enrolled: c.payroll_enrolled,
+      payroll_dataset_date: c.payroll_dataset_date
+    };
+    g.children.push(child);
+    if (child.total !== null && child.total !== undefined) { g.total += child.total; g.has_total = true; }
+    if (child.eligible !== null && child.eligible !== undefined) { g.eligible += child.eligible; g.has_eligible = true; }
+    if (child.enrolled !== null && child.enrolled !== undefined) { g.enrolled += child.enrolled; g.has_enrolled = true; }
+  });
+  return order.map(function (key) {
+    const g = map[key];
+    g.children.sort(function (a, b) { return String(a.company_code).localeCompare(String(b.company_code)); });
+    return {
+      code: g.code, name: g.name,
+      total: g.has_total ? g.total : null,
+      eligible: g.has_eligible ? g.eligible : null,
+      enrolled: g.has_enrolled ? g.enrolled : null,
+      children: g.children
+    };
+  });
 }
 
-// ---------------------------------------------------------------- steward: clients (payroll data only, no implementation data)
+// ---------------------------------------------------------------- steward: clients (parent cards with rolled-up payroll)
 app.get('/api/clients', requireAuth, async (req, res) => {
   try {
     const ids = await visibleCompanyIds(req.user);
@@ -345,16 +409,53 @@ app.get('/api/clients', requireAuth, async (req, res) => {
     const q = req.query.q ? String(req.query.q).toLowerCase() : '';
     if (q) {
       params.push('%' + q + '%');
-      where += (where ? ' AND ' : 'WHERE ') + '(LOWER(c.company_code) LIKE $' + params.length + ' OR LOWER(c.company_name) LIKE $' + params.length + ')';
+      where += (where ? ' AND ' : 'WHERE ') + '(LOWER(c.company_code) LIKE $' + params.length +
+        ' OR LOWER(c.company_name) LIKE $' + params.length +
+        ' OR LOWER(COALESCE(c.parent_company_code, ' + "''" + ')) LIKE $' + params.length +
+        ' OR LOWER(COALESCE(c.parent_company_name, ' + "''" + ')) LIKE $' + params.length + ')';
     }
-    const r = await getPool().query('SELECT * FROM companies c ' + where + ' ' + numericCodeSort(), params);
-    res.json(r.rows);
+    const r = await getPool().query('SELECT * FROM companies c ' + where + ' ' + numericCodeSort('c'), params);
+    res.json(groupParents(r.rows));
   } catch (error) {
     console.error('Load clients error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
+// Parent detail: child cards + stewards (union) + implementations across children.
+app.get('/api/parents/:code', requireAuth, async (req, res) => {
+  try {
+    const code = String(req.params.code);
+    const ids = await visibleCompanyIds(req.user);
+    let where = "(c.company_code = $1 OR c.parent_company_code = $1)";
+    const params = [code];
+    if (ids) {
+      if (ids.length === 0) return res.status(403).json({ error: 'Not assigned to this client' });
+      params.push(ids);
+      where = "(" + where + ") AND c.id = ANY($" + params.length + ")";
+    }
+    const rows = await getPool().query('SELECT * FROM companies c WHERE ' + where + ' ' + numericCodeSort('c'), params);
+    if (rows.rows.length === 0) return res.status(404).json({ error: 'Client not found' });
+    const groups = groupParents(rows.rows);
+    const group = groups[0];
+    const childIds = rows.rows.map(c => c.id);
+    const impls = await getPool().query(
+      'SELECT i.*, c.company_code, c.company_name, ' +
+      'EXTRACT(DAY FROM (NOW() - i.updated_at))::int AS days_in_stage, ' +
+      '(SELECT body FROM implementation_summaries s WHERE s.implementation_id = i.id ORDER BY s.summary_date DESC LIMIT 1) AS latest_summary ' +
+      'FROM implementations i JOIN companies c ON c.id = i.company_id ' +
+      'WHERE i.company_id = ANY($1) ORDER BY i.updated_at DESC', [childIds]);
+    const stewards = await getPool().query(
+      'SELECT DISTINCT s.id, s.first_name, s.last_name, s.name, s.email FROM stewards s ' +
+      'JOIN assignments a ON a.steward_id = s.id WHERE a.company_id = ANY($1) ORDER BY s.id', [childIds]);
+    res.json({ parent: group, children: rows.rows, implementations: impls.rows, stewards: stewards.rows });
+  } catch (error) {
+    console.error('Load parent error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Child detail: full payroll, stewards, implementation cards.
 app.get('/api/clients/:id', requireAuth, async (req, res) => {
   try {
     const ids = await visibleCompanyIds(req.user);
@@ -417,9 +518,10 @@ app.get('/api/implementations/:id', requireAuth, async (req, res) => {
   try {
     const ids = await visibleCompanyIds(req.user);
     const r = await getPool().query(
-      'SELECT i.*, c.company_code, c.company_name, c.payroll_total, c.payroll_ineligible, c.payroll_opted_out, ' +
-      'c.payroll_qualified, c.payroll_enrolled, c.payroll_not_enrolled, c.payroll_new_qualified, c.payroll_dataset_date, ' +
-      'EXTRACT(DAY FROM (NOW() - i.updated_at))::int AS days_in_stage ' +
+      'SELECT i.*, c.company_code, c.company_name, c.parent_company_code, c.parent_company_name, ' +
+      'EXTRACT(DAY FROM (NOW() - i.updated_at))::int AS days_in_stage, ' +
+      '(SELECT entered_at FROM stage_history h WHERE h.implementation_id = i.id AND h.exited_at IS NULL ' +
+      'ORDER BY h.entered_at DESC LIMIT 1) AS stage_entered_at ' +
       'FROM implementations i JOIN companies c ON c.id = i.company_id WHERE i.id = $1', [req.params.id]);
     if (r.rows.length === 0) return res.status(404).json({ error: 'Not found' });
     if (ids && ids.indexOf(r.rows[0].company_id) === -1) {
@@ -433,9 +535,7 @@ app.get('/api/implementations/:id', requireAuth, async (req, res) => {
     const sums = await getPool().query(
       'SELECT summary_date, body, created_at FROM implementation_summaries WHERE implementation_id = $1 ORDER BY summary_date DESC LIMIT 5',
       [req.params.id]);
-    const github_url = (impl.github_repo && impl.github_issue_number)
-      ? 'https://github.com/' + impl.github_repo + '/issues/' + impl.github_issue_number : null;
-    res.json({ implementation: impl, messages: msgs.rows, summaries: sums.rows, github_url: github_url });
+    res.json({ implementation: impl, messages: msgs.rows, summaries: sums.rows });
   } catch (error) {
     console.error('Load project error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -483,8 +583,6 @@ app.get('/api/admin/stewards', requireAdmin, async (req, res) => {
   }
 });
 
-// Admin sets (or resets) a steward's password directly. Everything else
-// about the steward record comes from the CSV import.
 app.post('/api/admin/stewards/:id/password', requireAdmin, async (req, res) => {
   try {
     const { password } = req.body || {};
@@ -504,7 +602,7 @@ app.post('/api/admin/stewards/:id/password', requireAdmin, async (req, res) => {
 // ---------------------------------------------------------------- admin: companies (read-only list; import only)
 app.get('/api/admin/companies', requireAdmin, async (req, res) => {
   try {
-    const r = await getPool().query('SELECT * FROM companies c ' + numericCodeSort());
+    const r = await getPool().query('SELECT * FROM companies c ' + numericCodeSort('c'));
     res.json(r.rows);
   } catch (error) {
     console.error('Admin companies error:', error);
@@ -528,9 +626,9 @@ app.get('/api/admin/assignments', requireAdmin, async (req, res) => {
 
 // ---------------------------------------------------------------- admin: import (the ONLY way to update these tables)
 // stewards:    email, first_name, last_name, phone, role (admin|steward)
-// companies:   company_code, company_name, payroll_total, payroll_ineligible,
-//              payroll_opted_out, payroll_qualified, payroll_enrolled,
-//              payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date
+// companies:   company_code, company_name, parent_company_code, parent_company_name,
+//              payroll_total, payroll_ineligible, payroll_opted_out, payroll_qualified,
+//              payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date
 // assignments: steward_id (or steward_email), company_code
 function validateImport(type, rows) {
   const errors = [];
@@ -554,6 +652,8 @@ function validateImport(type, rows) {
       seen[key] = true;
       valid.push({
         company_code: key, company_name: String(row.company_name).trim(),
+        parent_company_code: row.parent_company_code ? String(row.parent_company_code).trim() : null,
+        parent_company_name: row.parent_company_name ? String(row.parent_company_name).trim() : null,
         payroll_total: num(row.payroll_total), payroll_ineligible: num(row.payroll_ineligible),
         payroll_opted_out: num(row.payroll_opted_out), payroll_qualified: num(row.payroll_qualified),
         payroll_enrolled: num(row.payroll_enrolled), payroll_not_enrolled: num(row.payroll_not_enrolled),
@@ -591,7 +691,6 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
     if (type === 'stewards') {
       for (const s of v.valid) {
         try {
-          // Never let an import strip the requesting admin's own admin role.
           const selfRow = await db.query('SELECT id FROM stewards WHERE LOWER(email) = LOWER($1)', [s.email]);
           let role = s.role;
           if (selfRow.rows.length > 0 && String(selfRow.rows[0].id) === String(req.user.id) && role !== 'admin') {
@@ -609,15 +708,18 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
       for (const c of v.valid) {
         try {
           await db.query(
-            'INSERT INTO companies (company_code, company_name, payroll_total, payroll_ineligible, payroll_opted_out, ' +
+            'INSERT INTO companies (company_code, company_name, parent_company_code, parent_company_name, ' +
+            'payroll_total, payroll_ineligible, payroll_opted_out, ' +
             'payroll_qualified, payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date) ' +
-            'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ' +
+            'VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ' +
             'ON CONFLICT (company_code) DO UPDATE SET company_name = EXCLUDED.company_name, ' +
+            'parent_company_code = EXCLUDED.parent_company_code, parent_company_name = EXCLUDED.parent_company_name, ' +
             'payroll_total = EXCLUDED.payroll_total, payroll_ineligible = EXCLUDED.payroll_ineligible, ' +
             'payroll_opted_out = EXCLUDED.payroll_opted_out, payroll_qualified = EXCLUDED.payroll_qualified, ' +
             'payroll_enrolled = EXCLUDED.payroll_enrolled, payroll_not_enrolled = EXCLUDED.payroll_not_enrolled, ' +
             'payroll_new_qualified = EXCLUDED.payroll_new_qualified, payroll_dataset_date = EXCLUDED.payroll_dataset_date',
-            [c.company_code, c.company_name, c.payroll_total, c.payroll_ineligible, c.payroll_opted_out,
+            [c.company_code, c.company_name, c.parent_company_code, c.parent_company_name,
+              c.payroll_total, c.payroll_ineligible, c.payroll_opted_out,
               c.payroll_qualified, c.payroll_enrolled, c.payroll_not_enrolled, c.payroll_new_qualified, c.payroll_dataset_date]);
           imported++;
         } catch (err) { commitErrors.push(c.company_code + ': ' + err.message); }
@@ -645,14 +747,7 @@ app.post('/api/admin/import', requireAdmin, async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------- github mirror sync (link-only)
-// Board cards -> implementations, but ONLY for companies already on the
-// company list (matched by 4-digit company code). The sync never creates
-// companies. Cards without a code, or with a code not on the list, are
-// skipped. Implementations whose card is gone (or no longer matches) are
-// removed: a tile exists iff the company is on the list AND on the kanban.
-// Then pulls each linked issue's comments into messages.
-// Protected by x-sync-secret.
+// ---------------------------------------------------------------- github mirror sync (link-only) + stage learning
 async function fetchProjectItems() {
   const query = `query($after: String) { organization(login: "` + GITHUB_ORG + `") { projectV2(number: ` + GITHUB_PROJECT + `) { items(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { id content { __typename ... on DraftIssue { title } ... on Issue { title number repository { nameWithOwner } } ... on PullRequest { title } } fieldValues(first: 25) { nodes { __typename ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } } ... on ProjectV2ItemFieldNumberValue { number field { ... on ProjectV2Field { name } } } } } } } } } }`;
   const all = [];
@@ -672,6 +767,22 @@ async function fetchProjectItems() {
     after = items.pageInfo.endCursor;
   }
   return all;
+}
+
+// Record stage transitions so the summary prompt learns real durations.
+async function trackStage(db, implId, newStage) {
+  const cur = await db.query(
+    'SELECT id, stage FROM stage_history WHERE implementation_id = $1 AND exited_at IS NULL ORDER BY entered_at DESC LIMIT 1',
+    [implId]);
+  if (cur.rows.length === 0) {
+    await db.query('INSERT INTO stage_history (implementation_id, stage) VALUES ($1, $2)', [implId, newStage]);
+    return;
+  }
+  if (cur.rows[0].stage === newStage) return;
+  await db.query(
+    "UPDATE stage_history SET exited_at = NOW(), days = EXTRACT(DAY FROM (NOW() - entered_at))::int WHERE id = $1",
+    [cur.rows[0].id]);
+  await db.query('INSERT INTO stage_history (implementation_id, stage) VALUES ($1, $2)', [implId, newStage]);
 }
 
 app.post('/api/admin/sync-github', async (req, res) => {
@@ -703,28 +814,28 @@ app.post('/api/admin/sync-github', async (req, res) => {
       const fullTitle = (item.content && item.content.title) ? item.content.title : 'Untitled';
       const issueNumber = (item.content && item.content.__typename === 'Issue') ? item.content.number : null;
       const repo = (item.content && item.content.repository) ? item.content.repository.nameWithOwner : null;
-      await db.query(
+      const stage = status || 'No Status';
+      const up = await db.query(
         'INSERT INTO implementations (company_id, stage, status, github_item_id, github_issue_number, github_repo, card_title, payroll_provider, payroll_frequency, updated_at) ' +
         'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) ' +
         'ON CONFLICT (github_item_id) DO UPDATE SET company_id = EXCLUDED.company_id, stage = EXCLUDED.stage, ' +
         'status = EXCLUDED.status, github_issue_number = EXCLUDED.github_issue_number, github_repo = EXCLUDED.github_repo, ' +
         'card_title = EXCLUDED.card_title, payroll_provider = EXCLUDED.payroll_provider, ' +
-        'payroll_frequency = EXCLUDED.payroll_frequency, updated_at = NOW()',
-        [companyId, status || 'No Status', fields['Priority'] || 'NORMAL', item.id, issueNumber, repo,
+        'payroll_frequency = EXCLUDED.payroll_frequency, updated_at = NOW() RETURNING id',
+        [companyId, stage, fields['Priority'] || 'NORMAL', item.id, issueNumber, repo,
           fullTitle, fields['Payroll Provider'] || null, fields['Payroll Frequency'] || null]);
+      await trackStage(db, up.rows[0].id, stage);
       syncedIds.push(item.id);
       synced++;
       if (issueNumber && repo) {
         try {
-          const impl = await db.query('SELECT id FROM implementations WHERE github_item_id = $1', [item.id]);
-          const implId = impl.rows[0].id;
           const comments = await fetchIssueComments(repo, issueNumber);
           for (const c of comments) {
             const login = (c.user && c.user.login) ? c.user.login : 'github';
             await db.query(
               'INSERT INTO messages (implementation_id, github_comment_id, author_name, author_login, body, direction, github_created_at) ' +
               'VALUES ($1, $2, $3, $4, $5, ' + "'in'" + ', $6) ON CONFLICT (github_comment_id) DO NOTHING',
-              [implId, c.id, login, login, c.body || '', c.created_at]);
+              [up.rows[0].id, c.id, login, login, c.body || '', c.created_at]);
             commentsPulled++;
           }
         } catch (ce) {
@@ -732,7 +843,6 @@ app.post('/api/admin/sync-github', async (req, res) => {
         }
       }
     }
-    // Tiles exist iff on the company list AND on the kanban: drop the rest.
     if (syncedIds.length > 0) {
       await db.query('DELETE FROM implementations WHERE github_item_id IS NOT NULL AND NOT (github_item_id = ANY($1))', [syncedIds]);
     } else {
@@ -746,18 +856,43 @@ app.post('/api/admin/sync-github', async (req, res) => {
   }
 });
 
-// ---------------------------------------------------------------- claude summaries (Sun-Thu nights)
-async function claudeSummarize(impl, company, recentMessages) {
+// ---------------------------------------------------------------- claude summaries (Sun-Thu nights + on demand)
+// Learns stage durations from real cases (stage_history); falls back to defaults.
+async function typicalDurations(db) {
+  const out = {};
+  try {
+    const r = await db.query(
+      'SELECT stage, ROUND(AVG(days))::int AS avg_days, COUNT(*)::int AS n FROM stage_history ' +
+      'WHERE days IS NOT NULL GROUP BY stage');
+    r.rows.forEach(function (x) { out[x.stage] = { days: x.avg_days, cases: x.n }; });
+  } catch (e) { console.error('Duration learning query failed:', e.message); }
+  return out;
+}
+
+async function claudeSummarize(db, impl, company, recentMessages, typical) {
   const nl = String.fromCharCode(10);
-  const msgText = recentMessages.slice(-15).map(m => '- ' + (m.author_name || 'unknown') + ': ' + String(m.body || '').slice(0, 400)).join(nl);
+  const msgText = recentMessages.slice(-20).map(m => '- ' + (m.author_name || 'unknown') + ' (' + (m.when || '') + '): ' + String(m.body || '').slice(0, 400)).join(nl);
+  const durLines = STAGES.map(function (s) {
+    const t = typical[s];
+    const days = t ? t.days + ' (observed over ' + t.cases + ' real cases)' : DEFAULT_STAGE_DAYS[s] + ' (default estimate)';
+    return '- ' + s + ': ' + days + ' working days';
+  }).join(nl);
+  const stageEntered = impl.stage_entered_at ? new Date(impl.stage_entered_at).toLocaleDateString() : 'unknown';
   const prompt = 'You are a project manager writing a brief nightly update for the project owner. ' +
     'Project: ' + company.company_name + ' (company code ' + company.company_code + '). ' +
-    'Current stage: ' + (impl.stage || 'unknown') + '. Status: ' + (impl.status || 'unknown') + '. ' +
-    'Card: ' + (impl.card_title || '') + '. ' +
-    'Recent messages:' + nl + (msgText || '(none)') + nl + nl +
-    'Write a short update with: 1) one-paragraph summary of where the project stands, ' +
-    '2) current to-dos, 3) any obstacles or roadblocks and who is working on them. ' +
-    'Keep it tight and plain-spoken.';
+    'Current stage: ' + (impl.stage || 'unknown') + ' (entered ' + stageEntered + ', ' + (impl.days_in_stage || 0) + ' days in stage). ' +
+    'Status: ' + (impl.status || 'unknown') + '. Card: ' + (impl.card_title || '') + '.' + nl +
+    'Typical working days per stage:' + nl + durLines + nl +
+    'Recent messages (newest last):' + nl + (msgText || '(none)') + nl + nl +
+    'Write the update in EXACTLY this format:' + nl +
+    'STATUS: RED, YELLOW, or GREEN (your judgment: RED = blocked or seriously off track, YELLOW = at risk or stalled, GREEN = on track)' + nl +
+    'KEY DATES:' + nl +
+    '- one bullet per important date: when the current stage started, expected completion of the current stage (use the typical durations above), expected go-live, and any due dates mentioned in the messages' + nl +
+    'SUMMARY:' + nl +
+    '- 1-2 sentences on the current status and what has been accomplished recently' + nl +
+    '- Outstanding to-dos, each with WHAT needs doing, WHO owns it, and the DUE DATE (use TBD where unknown)' + nl +
+    '- Obstacles or roadblocks and who is working on them' + nl +
+    'Keep it tight and plain-spoken. No preamble, no sign-off.';
   const resp = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -767,7 +902,7 @@ async function claudeSummarize(impl, company, recentMessages) {
     },
     body: JSON.stringify({
       model: ANTHROPIC_MODEL,
-      max_tokens: 600,
+      max_tokens: 800,
       messages: [{ role: 'user', content: prompt }]
     })
   });
@@ -782,8 +917,13 @@ app.post('/api/admin/run-summaries', async (req, res) => {
   if (!ANTHROPIC_API_KEY) return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not set' });
   try {
     const db = getPool();
+    const typical = await typicalDurations(db);
     const impls = await db.query(
-      'SELECT i.*, c.company_name, c.company_code FROM implementations i JOIN companies c ON c.id = i.company_id ' +
+      'SELECT i.*, c.company_name, c.company_code, ' +
+      'EXTRACT(DAY FROM (NOW() - i.updated_at))::int AS days_in_stage, ' +
+      '(SELECT entered_at FROM stage_history h WHERE h.implementation_id = i.id AND h.exited_at IS NULL ' +
+      'ORDER BY h.entered_at DESC LIMIT 1) AS stage_entered_at ' +
+      'FROM implementations i JOIN companies c ON c.id = i.company_id ' +
       "WHERE COALESCE(i.stage, '') <> 'Complete' ORDER BY i.id");
     const today = new Date().toISOString().slice(0, 10);
     let done = 0;
@@ -791,9 +931,10 @@ app.post('/api/admin/run-summaries', async (req, res) => {
     for (const impl of impls.rows) {
       try {
         const msgs = await db.query(
-          'SELECT author_name, body FROM messages WHERE implementation_id = $1 ORDER BY COALESCE(github_created_at, created_at) DESC LIMIT 15',
+          'SELECT author_name, body, COALESCE(github_created_at, created_at) AS when FROM messages ' +
+          'WHERE implementation_id = $1 ORDER BY COALESCE(github_created_at, created_at) DESC LIMIT 20',
           [impl.id]);
-        const body = await claudeSummarize(impl, impl, msgs.rows.reverse());
+        const body = await claudeSummarize(db, impl, impl, msgs.rows.reverse(), typical);
         await db.query(
           'INSERT INTO implementation_summaries (implementation_id, summary_date, body) VALUES ($1, $2, $3) ' +
           'ON CONFLICT (implementation_id, summary_date) DO UPDATE SET body = EXCLUDED.body',

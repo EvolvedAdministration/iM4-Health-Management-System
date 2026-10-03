@@ -1,5 +1,5 @@
-// iM4 Health Management System (Smart Hub) - v3 frontend
-// Full-replacement SPA: hash routing, JWT auth, card UI with filters.
+// iM4 Health Management System (Smart Hub) - v4 frontend
+// Full-replacement SPA: hash routing, JWT auth, parent/child cards, hamburger nav.
 
 (function () {
 'use strict';
@@ -29,18 +29,15 @@ function personName(p) {
   return full || p.name || p.email || '';
 }
 
-function qualifiedOf(c) {
-  if (c.payroll_qualified !== null && c.payroll_qualified !== undefined) return c.payroll_qualified;
-  if (c.payroll_total === null || c.payroll_total === undefined) return null;
-  return (c.payroll_total || 0) - (c.payroll_ineligible || 0) - (c.payroll_opted_out || 0);
+function num(v) {
+  return (v === null || v === undefined) ? null : v;
 }
 
-function payrollLine(c) {
-  var q = qualifiedOf(c);
+function rollLine(total, eligible, enrolled) {
   var parts = [];
-  if (c.payroll_enrolled !== null && c.payroll_enrolled !== undefined) parts.push('<span><b>' + c.payroll_enrolled + '</b> enrolled</span>');
-  if (q !== null) parts.push('<span><b>' + q + '</b> qualified</span>');
-  if (c.payroll_total !== null && c.payroll_total !== undefined) parts.push('<span><b>' + c.payroll_total + '</b> total</span>');
+  if (total !== null && total !== undefined) parts.push('<span><b>' + total + '</b> total</span>');
+  if (eligible !== null && eligible !== undefined) parts.push('<span><b>' + eligible + '</b> eligible</span>');
+  if (enrolled !== null && enrolled !== undefined) parts.push('<span><b>' + enrolled + '</b> enrolled</span>');
   if (parts.length === 0) return '<span class="muted">No payroll data yet</span>';
   return parts.join(' ');
 }
@@ -77,51 +74,70 @@ var api = {
 
 var state = { user: null };
 
-// ---------------------------------------------------------------- shell
+// ---------------------------------------------------------------- header (same on every page)
 function logoHtml(size) {
-  size = size || 44;
-  return '<span class="logo" style="height:' + size + 'px">' +
-    '<svg width="' + size + '" height="' + size + '" viewBox="0 0 48 48" aria-hidden="true">' +
-    '<rect x="2" y="2" width="44" height="44" rx="10" fill="#1a56db"/>' +
+  size = size || 34;
+  return '<svg width="' + size + '" height="' + size + '" viewBox="0 0 48 48" aria-hidden="true">' +
+    '<rect x="2" y="2" width="44" height="44" rx="10" fill="#0099FF"/>' +
     '<text x="24" y="30" text-anchor="middle" font-family="Arial, sans-serif" font-weight="bold" font-size="19" fill="#ffffff">iM4</text>' +
-    '<rect x="10" y="35" width="28" height="4" rx="2" fill="#e02424"/>' +
-    '<rect x="10" y="35" width="11" height="4" rx="2" fill="#f5b301"/>' +
-    '</svg>' +
-    '<span class="logo-text"><span class="logo-name">I AM 4 <b>HEALTH</b></span>' +
-    '<span class="logo-sub">Management System</span></span></span>';
+    '<rect x="10" y="35" width="28" height="4" rx="2" fill="#FF3366"/>' +
+    '<rect x="10" y="35" width="11" height="4" rx="2" fill="#FFCC66"/>' +
+    '</svg>';
+}
+
+function navLinks() {
+  var u = state.user;
+  var links = [
+    ['#/clients', 'Clients'],
+    ['#/implementations', 'Implementations']
+  ];
+  if (u && u.role === 'admin') {
+    links.push(['#/admin/stewards', 'Stewards']);
+    links.push(['#/admin/companies', 'Companies']);
+    links.push(['#/admin/assignments', 'Assignments']);
+    links.push(['#/admin/import', 'Import']);
+  }
+  return links;
 }
 
 function shell(inner, active) {
   var u = state.user;
-  var tabs = '';
+  var menu = '';
   if (u) {
-    tabs += navTab('#/clients', 'Clients', active === 'clients');
-    tabs += navTab('#/implementations', 'Implementations', active === 'implementations');
-    if (u.role === 'admin') {
-      tabs += navTab('#/admin/stewards', 'Stewards', active === 'stewards');
-      tabs += navTab('#/admin/companies', 'Companies', active === 'admin-companies');
-      tabs += navTab('#/admin/assignments', 'Assignments', active === 'assignments');
-      tabs += navTab('#/admin/import', 'Import', active === 'import');
-    }
+    var items = navLinks().map(function (l) {
+      var on = active === l[1].toLowerCase().replace(/ /g, '-');
+      return '<a class="menu-item' + (on ? ' active' : '') + '" href="' + l[0] + '">' + l[1] + '</a>';
+    }).join('');
+    menu = '<div class="hamb-wrap"><button class="hamb" id="hamb" aria-label="Menu">&#9776;</button>' +
+      '<div class="hamb-menu" id="hambmenu">' + items + '</div></div>';
   }
   var userBox = u
     ? '<span class="user-email">' + esc(u.name || u.email) + ' <em>(' + esc(u.role) + ')</em></span>' +
       '<button class="btn btn-link" id="signout">Sign out</button>'
     : '';
-  return '<header class="topbar">' + logoHtml(40) +
-    '<nav class="tabs">' + tabs + '</nav>' +
+  return '<header class="topbar">' + menu +
+    '<a class="brand" href="#/clients">' + logoHtml(34) + '<span class="brand-text">Management System</span></a>' +
     '<div class="userbox">' + userBox + '</div></header>' +
     '<main class="main">' + inner + '</main>';
-}
-
-function navTab(href, label, isActive) {
-  return '<a class="tab' + (isActive ? ' active' : '') + '" href="' + href + '">' + label + '</a>';
 }
 
 function render(html) {
   document.getElementById('app').innerHTML = html;
   var so = document.getElementById('signout');
   if (so) so.onclick = function () { api.setToken(null); state.user = null; location.hash = '#/login'; };
+  var hamb = document.getElementById('hamb');
+  var hm = document.getElementById('hambmenu');
+  if (hamb && hm) {
+    hamb.onclick = function (e) {
+      e.stopPropagation();
+      hm.classList.toggle('open');
+    };
+    document.addEventListener('click', function () { hm.classList.remove('open'); });
+    var links = hm.querySelectorAll('a');
+    for (var i = 0; i < links.length; i++) {
+      links[i].onclick = function () { hm.classList.remove('open'); };
+    }
+  }
   window.scrollTo(0, 0);
 }
 
@@ -140,7 +156,7 @@ function filterBar(searchVal, extra) {
 
 // ---------------------------------------------------------------- auth views
 function viewLogin() {
-  render('<div class="auth-wrap"><div class="auth-card">' + logoHtml(56) +
+  render('<div class="auth-wrap"><div class="auth-card">' + logoHtml(52) +
     '<h1>Sign in</h1><div id="err"></div>' +
     '<form id="f"><label>Email<input type="email" id="email" required autocomplete="username"></label>' +
     '<label>Password<input type="password" id="password" required autocomplete="current-password"></label>' +
@@ -161,7 +177,7 @@ function viewLogin() {
 }
 
 function viewForgot() {
-  render('<div class="auth-wrap"><div class="auth-card">' + logoHtml(56) +
+  render('<div class="auth-wrap"><div class="auth-card">' + logoHtml(52) +
     '<h1>Reset password</h1><div id="msg"></div>' +
     '<form id="f"><label>Email<input type="email" id="email" required></label>' +
     '<button class="btn btn-primary" type="submit">Send reset link</button></form>' +
@@ -177,7 +193,7 @@ function viewForgot() {
 }
 
 function viewReset(token) {
-  render('<div class="auth-wrap"><div class="auth-card">' + logoHtml(56) +
+  render('<div class="auth-wrap"><div class="auth-card">' + logoHtml(52) +
     '<h1>Set a new password</h1><div id="msg"></div>' +
     '<form id="f"><label>New password (8+ characters)<input type="password" id="pw" required minlength="8"></label>' +
     '<button class="btn btn-primary" type="submit">Set password</button></form></div></div>');
@@ -199,29 +215,26 @@ function requireUser(next) {
     .catch(function () { location.hash = '#/login'; });
 }
 
-// ---------------------------------------------------------------- clients (payroll data only)
-function clientCards(list) {
-  return list.map(function (c) {
-    return '<a class="card" href="#/clients/' + c.id + '">' +
-      '<div class="card-code">' + esc(c.company_code) + '</div>' +
-      '<div class="card-title">' + esc(c.company_name) + '</div>' +
-      '<div class="card-numbers">' + payrollLine(c) + '</div>' +
-      (c.payroll_dataset_date ? '<div class="muted">Last payroll: ' + fmtDate(c.payroll_dataset_date) + '</div>' : '') +
-      '</a>';
-  }).join('');
-}
-
+// ---------------------------------------------------------------- clients (parent cards, rolled-up payroll)
 function viewClients() {
   requireUser(function () {
     var q = '';
     function load() {
       var url = '/api/clients' + (q ? '?q=' + encodeURIComponent(q) : '');
-      api.get(url).then(function (list) {
+      api.get(url).then(function (groups) {
+        var cards = groups.map(function (g) {
+          var sub = g.children.length > 1 ? g.children.length + ' companies' : '1 company';
+          return '<a class="card" href="#/parent/' + esc(g.code) + '">' +
+            '<div class="card-code">' + esc(g.code) + '</div>' +
+            '<div class="card-title">' + esc(g.name) + '</div>' +
+            '<div class="card-numbers">' + rollLine(g.total, g.eligible, g.enrolled) + '</div>' +
+            '<div class="muted">' + sub + '</div></a>';
+        }).join('');
         render(shell(
           '<h2>Clients</h2>' + filterBar(q) + '<div id="err"></div>' +
-          (list.length === 0
+          (groups.length === 0
             ? '<p class="muted">No clients found. Ask your administrator to import companies and assign them to you.</p>'
-            : '<div class="card-grid">' + clientCards(list) + '</div>'),
+            : '<div class="card-grid">' + cards + '</div>'),
           'clients'));
         var fq = document.getElementById('fq');
         fq.onchange = function () { q = fq.value; load(); };
@@ -232,7 +245,12 @@ function viewClients() {
   });
 }
 
-// ---------------------------------------------------------------- client detail (2nd page: implementation cards + visual)
+function statusBadge(status) {
+  var cls = 'badge';
+  if (status === 'RUSH') cls += ' badge-rush';
+  return '<span class="' + cls + '">' + esc(status || '') + '</span>';
+}
+
 function miniPipeline(current) {
   var idx = STAGES.indexOf(current);
   var html = '<div class="mini-pipe">';
@@ -245,25 +263,38 @@ function miniPipeline(current) {
   return html + '</div>';
 }
 
-function viewClientDetail(id) {
+function implCard(i) {
+  return '<a class="card" href="#/project/' + i.id + '">' +
+    '<div class="card-code">' + esc(i.company_code) + '</div>' +
+    '<div class="card-title">' + esc(i.company_name) + '</div>' +
+    miniPipeline(i.stage) +
+    '<div class="card-meta"><b>' + esc(i.stage || '') + '</b> ' + statusBadge(i.status) +
+    (i.days_in_stage !== null && i.days_in_stage !== undefined ? ' <span class="muted">&middot; ' + i.days_in_stage + ' days in stage</span>' : '') + '</div>' +
+    (i.latest_summary ? '<div class="card-summary">' + esc(i.latest_summary.slice(0, 140)) + '&hellip;</div>' : '') +
+    '</a>';
+}
+
+// Parent detail: one card per child + stewards + implementations.
+function viewParent(code) {
   requireUser(function () {
-    api.get('/api/clients/' + id).then(function (d) {
-      var c = d.company;
-      var implCards = d.implementations.map(function (i) {
-        return '<a class="card" href="#/project/' + i.id + '">' +
-          '<div class="card-title">' + esc(i.card_title || c.company_name) + '</div>' +
-          miniPipeline(i.stage) +
-          '<div class="card-meta"><b>' + esc(i.stage || '') + '</b> ' + statusBadge(i.status) +
-          (i.days_in_stage !== null && i.days_in_stage !== undefined ? ' <span class="muted">&middot; ' + i.days_in_stage + ' days in stage</span>' : '') + '</div>' +
-          (i.latest_summary ? '<div class="card-summary">' + esc(i.latest_summary.slice(0, 160)) + '&hellip;</div>' : '') +
-          (i.message_count ? '<div class="muted">' + i.message_count + ' messages</div>' : '') + '</a>';
+    api.get('/api/parents/' + encodeURIComponent(code)).then(function (d) {
+      var p = d.parent;
+      var childCards = d.children.map(function (c) {
+        var elig = (c.payroll_qualified !== null && c.payroll_qualified !== undefined) ? c.payroll_qualified
+          : (c.payroll_total !== null && c.payroll_total !== undefined ? (c.payroll_total || 0) - (c.payroll_ineligible || 0) - (c.payroll_opted_out || 0) : null);
+        return '<a class="card" href="#/child/' + c.id + '">' +
+          '<div class="card-code">' + esc(c.company_code) + '</div>' +
+          '<div class="card-title">' + esc(c.company_name) + '</div>' +
+          '<div class="card-numbers">' + rollLine(c.payroll_total, elig, c.payroll_enrolled) + '</div></a>';
       }).join('');
       var stewardList = d.stewards.map(function (s) { return esc(personName(s)); }).join(', ');
+      var implCards = d.implementations.map(implCard).join('');
       render(shell(
         '<p><a href="#/clients">&larr; Clients</a></p>' +
-        '<h2><span class="code-chip">' + esc(c.company_code) + '</span> ' + esc(c.company_name) + '</h2>' +
-        '<h3>Last payroll</h3>' + payrollTable(c) +
+        '<h2><span class="code-chip">' + esc(p.code) + '</span> ' + esc(p.name) + '</h2>' +
+        '<div class="rollup"><b>Roll-up:</b> ' + rollLine(p.total, p.eligible, p.enrolled) + '</div>' +
         (stewardList ? '<p class="muted">Stewards: ' + stewardList + '</p>' : '') +
+        '<h3>Companies</h3><div class="card-grid">' + childCards + '</div>' +
         '<h3>Implementations</h3>' +
         (implCards ? '<div class="card-grid">' + implCards + '</div>' : '<p class="muted">No implementations on the kanban for this client yet.</p>'),
         'clients'));
@@ -271,26 +302,49 @@ function viewClientDetail(id) {
   });
 }
 
-// ---------------------------------------------------------------- implementations (implementation data only)
-function statusBadge(status) {
-  var cls = 'badge';
-  if (status === 'RUSH') cls += ' badge-rush';
-  return '<span class="' + cls + '">' + esc(status || '') + '</span>';
+function payrollTable(c) {
+  function elig() {
+    if (c.payroll_qualified !== null && c.payroll_qualified !== undefined) return c.payroll_qualified;
+    if (c.payroll_total === null || c.payroll_total === undefined) return null;
+    return (c.payroll_total || 0) - (c.payroll_ineligible || 0) - (c.payroll_opted_out || 0);
+  }
+  function row(label, v) {
+    return '<tr><td>' + label + '</td><td><b>' + (v === null || v === undefined ? '&mdash;' : esc(v)) + '</b></td></tr>';
+  }
+  return '<table class="data-table"><tbody>' +
+    row('Total employees', c.payroll_total) +
+    row('Ineligible', c.payroll_ineligible) +
+    row('Opted out', c.payroll_opted_out) +
+    row('Eligible', elig()) +
+    row('Enrolled', c.payroll_enrolled) +
+    row('Not enrolled', c.payroll_not_enrolled) +
+    row('New qualified', c.payroll_new_qualified) +
+    '</tbody></table>' +
+    (c.payroll_dataset_date ? '<p class="muted">Last payroll data: ' + fmtDate(c.payroll_dataset_date) + '</p>' : '');
 }
 
-function implCards(list) {
-  return list.map(function (i) {
-    return '<a class="card" href="#/project/' + i.id + '">' +
-      '<div class="card-code">' + esc(i.company_code) + '</div>' +
-      '<div class="card-title">' + esc(i.company_name) + '</div>' +
-      miniPipeline(i.stage) +
-      '<div class="card-meta"><b>' + esc(i.stage || '') + '</b> ' + statusBadge(i.status) +
-      (i.days_in_stage !== null && i.days_in_stage !== undefined ? ' <span class="muted">&middot; ' + i.days_in_stage + ' days in stage</span>' : '') + '</div>' +
-      (i.latest_summary ? '<div class="card-summary">' + esc(i.latest_summary.slice(0, 140)) + '&hellip;</div>' : '') +
-      '</a>';
-  }).join('');
+// Child detail: payroll + stewards + implementation cards.
+function viewChild(id) {
+  requireUser(function () {
+    api.get('/api/clients/' + id).then(function (d) {
+      var c = d.company;
+      var implCards = d.implementations.map(implCard).join('');
+      var stewardList = d.stewards.map(function (s) { return esc(personName(s)); }).join(', ');
+      var parentLink = (c.parent_company_code && c.parent_company_code !== c.company_code)
+        ? '<p><a href="#/parent/' + esc(c.parent_company_code) + '">&larr; ' + esc(c.parent_company_name || c.parent_company_code) + '</a></p>'
+        : '<p><a href="#/clients">&larr; Clients</a></p>';
+      render(shell(parentLink +
+        '<h2><span class="code-chip">' + esc(c.company_code) + '</span> ' + esc(c.company_name) + '</h2>' +
+        '<h3>Last payroll</h3>' + payrollTable(c) +
+        (stewardList ? '<p class="muted">Stewards: ' + stewardList + '</p>' : '') +
+        '<h3>Implementations</h3>' +
+        (implCards ? '<div class="card-grid">' + implCards + '</div>' : '<p class="muted">No implementations on the kanban for this company yet.</p>'),
+        'clients'));
+    }).catch(function (err) { render(shell(errorHtml(err.message), 'clients')); });
+  });
 }
 
+// ---------------------------------------------------------------- implementations (grouped by stage)
 function viewImplementations() {
   requireUser(function () {
     var q = '';
@@ -303,11 +357,27 @@ function viewImplementations() {
         var stageOpts = '<option value="">All stages</option>' + STAGES.map(function (s) {
           return '<option value="' + esc(s) + '"' + (s === stage ? ' selected' : '') + '>' + esc(s) + '</option>';
         }).join('');
+        var body;
+        if (list.length === 0) {
+          body = '<p class="muted">No implementations found.</p>';
+        } else if (stage) {
+          body = '<div class="card-grid">' + list.map(implCard).join('') + '</div>';
+        } else {
+          body = STAGES.map(function (s) {
+            var inStage = list.filter(function (i) { return i.stage === s; });
+            if (inStage.length === 0) return '';
+            return '<h3 class="stage-group">' + esc(s) + ' <span class="muted">(' + inStage.length + ')</span></h3>' +
+              '<div class="card-grid">' + inStage.map(implCard).join('') + '</div>';
+          }).join('');
+          var other = list.filter(function (i) { return STAGES.indexOf(i.stage) === -1; });
+          if (other.length > 0) {
+            body += '<h3 class="stage-group">Other <span class="muted">(' + other.length + ')</span></h3>' +
+              '<div class="card-grid">' + other.map(implCard).join('') + '</div>';
+          }
+        }
         render(shell(
           '<h2>Implementations</h2>' + filterBar(q, '<select id="fstage">' + stageOpts + '</select>') +
-          '<div id="err"></div>' +
-          (list.length === 0 ? '<p class="muted">No implementations found.</p>'
-            : '<div class="card-grid">' + implCards(list) + '</div>'),
+          '<div id="err"></div>' + body,
           'implementations'));
         var fq = document.getElementById('fq');
         var fs = document.getElementById('fstage');
@@ -320,35 +390,62 @@ function viewImplementations() {
   });
 }
 
-// ---------------------------------------------------------------- project view
-function stageVisual(current) {
+// ---------------------------------------------------------------- project view: lifecycle visual + summary | messages
+function lifecycleVisual(current, daysInStage) {
   var idx = STAGES.indexOf(current);
-  var html = '<div class="pipeline">';
+  var html = '<div class="lifecycle">';
   STAGES.forEach(function (s, i) {
-    var cls = 'pipe-step';
+    var cls = 'lc-step';
     if (i < idx) cls += ' done';
     if (i === idx) cls += ' current';
-    html += '<div class="' + cls + '"><span class="pipe-dot"></span><span class="pipe-label">' + esc(s) + '</span></div>';
+    html += '<div class="' + cls + '">' +
+      '<div class="lc-node">' + (i < idx ? '&#10003;' : (i + 1)) + '</div>' +
+      '<div class="lc-label">' + esc(s) + '</div>' +
+      (i === idx && daysInStage !== null && daysInStage !== undefined
+        ? '<div class="lc-days">' + daysInStage + ' days in stage</div>' : '') +
+      '</div>';
+    if (i < STAGES.length - 1) html += '<div class="lc-link' + (i < idx ? ' done' : '') + '"></div>';
   });
   html += '</div>';
   if (idx === -1 && current) html += '<p class="muted">Stage: ' + esc(current) + '</p>';
   return html;
 }
 
-function payrollTable(c) {
-  function row(label, v) {
-    return '<tr><td>' + label + '</td><td><b>' + (v === null || v === undefined ? '&mdash;' : esc(v)) + '</b></td></tr>';
+function parseRag(body) {
+  if (!body) return null;
+  var up = String(body).toUpperCase();
+  var at = up.indexOf('STATUS:');
+  if (at === -1) return null;
+  var tail = up.slice(at + 7, at + 24);
+  if (tail.indexOf('RED') !== -1) return 'RED';
+  if (tail.indexOf('YELLOW') !== -1) return 'YELLOW';
+  if (tail.indexOf('GREEN') !== -1) return 'GREEN';
+  return null;
+}
+
+function stripStatusLine(body) {
+  var lines = String(body).split(String.fromCharCode(10));
+  var kept = [];
+  for (var i = 0; i < lines.length; i++) {
+    if (lines[i].toUpperCase().indexOf('STATUS:') === 0) continue;
+    kept.push(lines[i]);
   }
-  return '<table class="data-table"><tbody>' +
-    row('Total employees', c.payroll_total) +
-    row('Ineligible', c.payroll_ineligible) +
-    row('Opted out', c.payroll_opted_out) +
-    row('Qualified', qualifiedOf(c)) +
-    row('Enrolled', c.payroll_enrolled) +
-    row('Not enrolled', c.payroll_not_enrolled) +
-    row('New qualified', c.payroll_new_qualified) +
-    '</tbody></table>' +
-    (c.payroll_dataset_date ? '<p class="muted">Last payroll data: ' + fmtDate(c.payroll_dataset_date) + '</p>' : '');
+  return kept.join(String.fromCharCode(10));
+}
+
+function ragBadge(body) {
+  var s = parseRag(body);
+  if (!s) return '';
+  var cls = s === 'RED' ? 'rag-red' : (s === 'YELLOW' ? 'rag-yellow' : 'rag-green');
+  return '<span class="rag ' + cls + '">' + s + '</span>';
+}
+
+function summaryHtml(s) {
+  if (!s) return '<p class="muted">No summaries yet. Summaries are generated nightly.</p>';
+  var body = stripStatusLine(esc(s.body));
+  return '<div class="summary">' + ragBadge(s.body) +
+    '<div class="muted">Summary &middot; ' + fmtDate(s.summary_date) + '</div>' +
+    '<div class="summary-body">' + body + '</div></div>';
 }
 
 function viewProject(id) {
@@ -363,28 +460,28 @@ function viewProject(id) {
           ' <span class="muted">' + fmtDateTime(m.github_created_at || m.created_at) + '</span></div>' +
           '<div class="msg-body">' + esc(m.body) + '</div></div>';
       }).join('');
-      var sums = d.summaries.map(function (s) {
-        return '<div class="summary"><div class="muted">Summary &middot; ' + fmtDate(s.summary_date) + '</div>' +
-          '<div class="summary-body">' + esc(s.body) + '</div></div>';
+      var latest = d.summaries.length > 0 ? d.summaries[0] : null;
+      var older = d.summaries.slice(1).map(function (s) {
+        return '<div class="summary summary-old">' + ragBadge(s.body) +
+          '<div class="muted">Summary &middot; ' + fmtDate(s.summary_date) + '</div>' +
+          '<div class="summary-body">' + stripStatusLine(esc(s.body)) + '</div></div>';
       }).join('');
       render(shell(
         '<p><a href="#/implementations">&larr; Implementations</a></p>' +
         '<h2><span class="code-chip">' + esc(i.company_code) + '</span> ' + esc(i.company_name) + '</h2>' +
-        (d.github_url ? '<p><a href="' + esc(d.github_url) + '" target="_blank" rel="noopener">View on GitHub</a></p>' : '') +
+        (i.parent_company_code ? '<p class="muted">' + esc(i.parent_company_name || i.parent_company_code) + '</p>' : '') +
         '<div class="proj-grid"><div>' +
-        '<h3>Stage</h3>' + stageVisual(i.stage) +
-        '<p>' + statusBadge(i.status) +
-        (i.days_in_stage !== null && i.days_in_stage !== undefined ? ' <span class="muted">' + i.days_in_stage + ' days in this stage</span>' : '') + '</p>' +
+        '<h3>Project lifecycle</h3>' + lifecycleVisual(i.stage, i.days_in_stage) +
+        '<p>' + statusBadge(i.status) + '</p>' +
         (i.card_title ? '<p class="muted">' + esc(i.card_title) + '</p>' : '') +
-        '<h3>Last payroll</h3>' + payrollTable(i) +
-        (sums ? '<h3>Project summaries</h3>' + sums : '<h3>Project summaries</h3><p class="muted">No summaries yet.</p>') +
+        '<h3>Project summary</h3>' + summaryHtml(latest) + older +
         '</div><div>' +
-        '<h3>Messages <span class="muted">(' + d.messages.length + ')</span></h3><div id="msglist">' +
-        (msgs || '<p class="muted">No messages yet. Start the conversation below.</p>') +
-        '</div><div id="merr"></div>' +
+        '<h3>Messages <span class="muted">(' + d.messages.length + ')</span></h3>' +
         '<form id="mform"><label>Post a message (goes to the GitHub card too)<textarea id="mbody" rows="3" required></textarea></label>' +
         '<button class="btn btn-primary" type="submit">Send message</button></form>' +
-        '</div></div>',
+        '<div id="merr"></div><div id="msglist">' +
+        (msgs || '<p class="muted">No messages yet. Start the conversation above.</p>') +
+        '</div></div></div>',
         'implementations'));
       document.getElementById('mform').onsubmit = function (e) {
         e.preventDefault();
@@ -438,26 +535,30 @@ function viewAdminStewards() {
   });
 }
 
-// ---------------------------------------------------------------- admin: companies (import only)
+// ---------------------------------------------------------------- admin: companies (import only, with parent columns)
 function viewAdminCompanies() {
   requireUser(function () {
     if (state.user.role !== 'admin') { location.hash = '#/clients'; return; }
     api.get('/api/admin/companies').then(function (list) {
-      function cell(v) { return '<td>' + (v === null || v === undefined ? '&mdash;' : esc(v)) + '</td>'; }
+      function cell(v) { return '<td>' + (v === null || v === undefined || v === '' ? '&mdash;' : esc(v)) + '</td>'; }
       var rows = list.map(function (c) {
+        var elig = (c.payroll_qualified !== null && c.payroll_qualified !== undefined) ? c.payroll_qualified
+          : (c.payroll_total !== null && c.payroll_total !== undefined ? (c.payroll_total || 0) - (c.payroll_ineligible || 0) - (c.payroll_opted_out || 0) : null);
         return '<tr><td><b>' + esc(c.company_code) + '</b></td><td>' + esc(c.company_name) + '</td>' +
+          cell(c.parent_company_code) + cell(c.parent_company_name) +
           cell(c.payroll_total) + cell(c.payroll_ineligible) + cell(c.payroll_opted_out) +
-          cell(qualifiedOf(c)) + cell(c.payroll_new_qualified) + cell(c.payroll_enrolled) + cell(c.payroll_not_enrolled) + '</tr>';
+          cell(elig) + cell(c.payroll_new_qualified) + cell(c.payroll_enrolled) + cell(c.payroll_not_enrolled) + '</tr>';
       }).join('');
       render(shell(
         '<h2>Companies</h2>' +
         '<p class="muted">Companies are updated by CSV import only (<a href="#/admin/import">Import tab</a>).</p>' +
-        '<div class="table-scroll"><table class="data-table"><thead><tr><th>Company Code</th><th>Company Name</th>' +
-        '<th colspan="7">Last Payroll</th></tr><tr><th></th><th></th>' +
-        '<th>Total Employees</th><th>Ineligible</th><th>Opt Out</th><th>Qualified</th><th>New Qualified</th><th>Enrolled</th><th>Not Enrolled</th></tr></thead>' +
+        '<div class="table-scroll"><table class="data-table"><thead>' +
+        '<tr><th>Company Code</th><th>Company Name</th><th>Parent Code</th><th>Parent Name</th>' +
+        '<th colspan="7">Last Payroll</th></tr><tr><th></th><th></th><th></th><th></th>' +
+        '<th>Total Employees</th><th>Ineligible</th><th>Opt Out</th><th>Eligible</th><th>New Qualified</th><th>Enrolled</th><th>Not Enrolled</th></tr></thead>' +
         '<tbody>' + rows + '</tbody></table></div>',
-        'admin-companies'));
-    }).catch(function (err) { render(shell(errorHtml(err.message), 'admin-companies')); });
+        'companies'));
+    }).catch(function (err) { render(shell(errorHtml(err.message), 'companies')); });
   });
 }
 
@@ -509,7 +610,7 @@ function parseCSV(text) {
 
 var IMPORT_FORMATS = {
   stewards: 'email, first_name, last_name, phone, role (steward or admin)',
-  companies: 'company_code, company_name, payroll_total, payroll_ineligible, payroll_opted_out, payroll_qualified, payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date (YYYY-MM-DD)',
+  companies: 'company_code, company_name, parent_company_code, parent_company_name, payroll_total, payroll_ineligible, payroll_opted_out, payroll_qualified, payroll_enrolled, payroll_not_enrolled, payroll_new_qualified, payroll_dataset_date (YYYY-MM-DD)',
   assignments: 'steward_id (or steward_email), company_code'
 };
 
@@ -568,7 +669,8 @@ function route() {
   if (h === '#/login' || h === '') return viewLogin();
   if (h === '#/forgot') return viewForgot();
   if (pathParts[0] === 'reset') return viewReset(query.token || '');
-  if (pathParts[0] === 'clients' && pathParts[1]) return viewClientDetail(pathParts[1]);
+  if (pathParts[0] === 'parent' && pathParts[1]) return viewParent(decodeURIComponent(pathParts[1]));
+  if (pathParts[0] === 'child' && pathParts[1]) return viewChild(pathParts[1]);
   if (pathParts[0] === 'clients') return viewClients();
   if (pathParts[0] === 'implementations') return viewImplementations();
   if (pathParts[0] === 'project' && pathParts[1]) return viewProject(pathParts[1]);
