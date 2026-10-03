@@ -881,8 +881,9 @@ async function trackStage(db, implId, newStage) {
 }
 
 // Pulls an issue's comments into the app and prunes app copies of comments
-// deleted on GitHub. Only incoming messages are reconciled; app-originated
-// messages are the system of record. Returns { pulled, pruned }. Throws on failure.
+// deleted on GitHub (both directions: the app mirrors the card's comment list).
+// Messages never posted to GitHub (NULL github_comment_id) are never pruned.
+// Returns { pulled, pruned }. Throws on failure.
 async function syncIssueComments(db, implId, repo, issueNumber) {
   const comments = await fetchIssueComments(repo, issueNumber);
   const seenIds = [];
@@ -897,7 +898,7 @@ async function syncIssueComments(db, implId, repo, issueNumber) {
     pulled++;
   }
   const gone = await db.query(
-    "DELETE FROM messages WHERE implementation_id = $1 AND direction = 'in' AND github_comment_id IS NOT NULL " +
+    'DELETE FROM messages WHERE implementation_id = $1 AND github_comment_id IS NOT NULL ' +
     'AND NOT (github_comment_id = ANY($2::bigint[]))',
     [implId, seenIds]);
   return { pulled: pulled, pruned: gone.rowCount };
