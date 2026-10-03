@@ -276,7 +276,7 @@ function ghHeaders() {
 }
 
 async function fetchProjectItems() {
-  const query = 'query($after: String) { organization(login: "' + GITHUB_ORG + '") { projectV2(number: ' + GITHUB_PROJECT + ') { items(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { id content { __typename ... on DraftIssue { title } ... on Issue { title number repository { nameWithOwner } } ... on PullRequest { title } } fieldValues(first: 25) { nodes { __typename ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } } ... on ProjectV2ItemFieldNumberValue { number field { ... on ProjectV2NumberField { name } } } } } } } } } }';
+  const query = 'query($after: String) { organization(login: "' + GITHUB_ORG + '") { projectV2(number: ' + GITHUB_PROJECT + ') { items(first: 100, after: $after) { pageInfo { hasNextPage endCursor } nodes { id content { __typename ... on DraftIssue { title } ... on Issue { title number repository { nameWithOwner } } ... on PullRequest { title } } fieldValues(first: 25) { nodes { __typename ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2SingleSelectField { name } } } ... on ProjectV2ItemFieldNumberValue { number field { ... on ProjectV2Field { name } } } } } } } } } } }';
   const all = [];
   let after = null;
   for (;;) {
